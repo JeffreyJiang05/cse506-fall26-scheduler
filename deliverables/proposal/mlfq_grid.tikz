@@ -1,0 +1,68 @@
+\begin{tikzpicture}[
+    scale=0.85, transform shape, % Scales down the entire diagram
+    queue node/.style={draw, minimum width=0.6cm, minimum height=0.4cm, anchor=center, font=\scriptsize\ttfamily},
+    axis arrow/.style={-{Latex[length=2.5mm]}, thick},
+    grid node/.style={draw, minimum width=0.8cm, minimum height=0.4cm, anchor=center, font=\scriptsize\ttfamily}
+]
+    % Define the grid
+    \matrix (mat) [
+        matrix of nodes,
+        nodes={grid node},
+        column sep=-\pgflinewidth,
+        row sep=-\pgflinewidth,
+        nodes in empty cells=false
+    ] {
+        |[name=m00]| [00] & |[name=m01]| [01] & |[name=m02]| [02] & |[name=m03]| [03] & |[name=m04]| [04] & |[name=m05]| [05] & |[name=m06]| [06] & |[name=m07]| [07] \\
+        |[name=m10]| [10] & |[name=m11]| [11] & |[name=m12]| [12] & |[name=m13]| [13] & |[name=m14]| [14] & |[name=m15]| [15] & |[name=m16]| [16] & |[name=m17]| [17] \\
+        |[name=m20]| [20] & |[name=m21]| [21] & |[name=m22]| [22] & |[name=m23]| [23] & |[name=m24]| [24] & |[name=m25]| [25] & |[name=m26]| [26] & |[name=m27]| [27] \\
+        |[name=m30]| [30] & |[name=m31]| [31] & |[name=m32]| [32] & |[name=m33]| [33] & |[name=m34]| [34] & |[name=m35]| [35] & |[name=m36]| [36] & |[name=m37]| [37] \\
+        |[name=m40]| [40] & |[name=m41]| [41] & |[name=m42]| [42] & |[name=m43]| [43] & |[name=m44]| [44] & |[name=m45]| [45] & |[name=m46]| [46] & |[name=m47]| [47] \\
+        |[name=m50]| [50] & |[name=m51]| [51] & |[name=m52]| [52] & |[name=m53]| [53] & |[name=m54]| [54] & |[name=m55]| [55] & |[name=m56]| [56] & |[name=m57]| [57] \\
+        |[name=m60]| [60] & |[name=m61]| [61] & |[name=m62]| [62] & |[name=m63]| [63] & |[name=m64]| [64] & |[name=m65]| [65] & |[name=m66]| [66] & |[name=m67]| [67] \\
+        |[name=m70]| [70] & |[name=m71]| [71] & |[name=m72]| [72] & |[name=m73]| [73] & |[name=m74]| [74] & |[name=m75]| [75] & |[name=m76]| [76] & |[name=m77]| [77] \\
+    };
+
+    % X-axis labels (Quanta) - Moved to top
+    \node [above=0.1cm of m00, font=\scriptsize\ttfamily] {1ms};
+    \node [above=0.1cm of m01, font=\scriptsize\ttfamily] {2ms};
+    \node [above=0.1cm of m02, font=\scriptsize\ttfamily] {4ms};
+    \node [above=0.1cm of m03, font=\scriptsize\ttfamily] {8ms};
+    \node [above=0.1cm of m04, font=\scriptsize\ttfamily] {16ms};
+    \node [above=0.1cm of m05, font=\scriptsize\ttfamily] {32ms};
+    \node [above=0.1cm of m06, font=\scriptsize\ttfamily] {64ms};
+    \node [above=0.1cm of m07, font=\scriptsize\ttfamily] {128ms};
+    
+    % Quanta Arrow - Moved to top
+    \draw[axis arrow] ([xshift=0.15cm, yshift=0.4cm]mat.north west) -- ([xshift=0.2cm, yshift=0.4cm]mat.north east) node[midway, above, font=\sffamily\bfseries\scriptsize] {Time Slice};
+
+    % Y-axis labels (Latency)
+    \node [left=0.15cm of m00, font=\scriptsize\ttfamily] {0 ms};
+    \node [left=0.15cm of m10, font=\scriptsize\ttfamily] {1 ms};
+    \node [left=0.15cm of m20, font=\scriptsize\ttfamily] {2 ms};
+    \node [left=0.15cm of m30, font=\scriptsize\ttfamily] {3 ms};
+    \node [left=0.15cm of m40, font=\scriptsize\ttfamily] {5 ms};
+    \node [left=0.15cm of m50, font=\scriptsize\ttfamily] {8 ms};
+    \node [left=0.15cm of m60, font=\scriptsize\ttfamily] {13 ms};
+    \node [left=0.15cm of m70, font=\scriptsize\ttfamily] {21 ms};
+    
+    % Latency Arrow
+    \draw[axis arrow] ([xshift=-0.9cm, yshift=-0.15cm]mat.north west) -- ([xshift=-0.9cm, yshift=-0.2cm]mat.south west) node[midway, above, rotate=90, font=\sffamily\bfseries\scriptsize] {Latency Requirements};
+
+    % Linked List Queue representations with traditional nodes & closed loops
+    \begin{scope}[shift={([xshift=1.2cm, yshift=-0.8cm]mat.south west)}] % Shifted down further to accommodate above-labels
+        % First list (Empty Queue) - single node routing back to itself
+        \node[queue node] (q00) at (0, 0) {00};
+        \draw[-latex, thick, rounded corners=2pt] (q00.south east) -- ++(0,-0.25) -| (q00.south west);
+        \node[above=0.15cm of q00, font=\scriptsize\ttfamily] {(Empty Queue)};
+
+        % Second list (Queue w/ processes) - positioned horizontally relative to the first
+        \node[queue node] (q45a) at (3.2, 0) {45};
+        \node[queue node] (qBB) at (4.4, 0) {BB};
+        \node[queue node] (qCC) at (5.6, 0) {CC};
+        \draw[-latex, thick] (q45a) -- (qBB);
+        \draw[-latex, thick] (qBB) -- (qCC);
+        \draw[-latex, thick, rounded corners=2pt] (qCC.south) -- ++(0,-0.25) -| (q45a.south);
+        % Centered the label above the middle node (qBB)
+        \node[above=0.15cm of qBB, font=\scriptsize\ttfamily] {(Queue w/ processes)}; 
+    \end{scope}
+\end{tikzpicture}

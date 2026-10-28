@@ -1,1 +1,2 @@
-# cse506-fall26-scheduler
+# CSE 506 Final Project - eBPF Scheduler and Performance Evaluations
+
