@@ -12,7 +12,11 @@
 static const char help_msg[] = 
 "The grid scheduler: A multidimensional multilevel feedback queue scheduler.\n"
 "\n"
-"Usage: %s\n";
+"Usage: %s [-h] [-l config-file] [-q config-file]\n"
+"\n"
+"  -l config-file  Configuration file for the latencies for each row of the DSQ grid\n"
+"  -q config-file  Configuration file for the time slices for each column of the DSQ grid\n"
+"  -h              Display this help and exit\n";
 
 #define DISPLAY_HELP_MSG(file, prog_name) do { \
     fprintf(file, help_msg, prog_name); \
