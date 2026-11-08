@@ -4,7 +4,7 @@
 #include <bpf/bpf.h>
 #include <scx/common.h>
 
-#include "common.h"
+#include "config.h"
 
 #include "grid.skel.h"
 #include "debug.h"

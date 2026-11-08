@@ -6,7 +6,7 @@
 #include <scx/common.bpf.h>
 
 #include "util.bpf.h"
-#include "common.h"
+#include "config.h"
 
 char _license[] SEC("license") = "GPL";
 UEI_DEFINE(uei);
@@ -25,12 +25,14 @@ UEI_DEFINE(uei);
  * Data to be populated by userspace
  */
 const volatile u32 nr_cpus; // Number of CPU cores
-const volatile u16 latency[8]; // Latency for each row in grid
-const volatile u16 slices[8]; // Time slices for each column in grid
+const volatile u16 latency[GRID_NR_ROWS]; // Latency for each row in grid
+const volatile u16 slices[GRID_NR_COLS]; // Time slices for each column in grid
 
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(grid_init)
 {
+
+	// Hard-coded here
     bpf_printk("Initializing Grid Scheduler");
 	bpf_printk("Total number of cores: %u", nr_cpus);
 	bpf_printk("Latencies: [%u %u %u %u %u %u %u %u]", 
