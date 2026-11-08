@@ -17,36 +17,57 @@ OBPFS = $(BPFS:$(SRCD)/bpf/%.bpf.c=$(BLDD)/bpf/%.bpf.o)
 SKELE = $(OBPFS:$(BLDD)/bpf/%.bpf.o=$(BLDD)/include/%.skel.h)
 
 # SCX Version
-SCX_VERSION = 1.1.4
+SCX_VERSION = 1.0.17
 SCX_URL = https://github.com/sched-ext/scx/archive/refs/tags/v$(SCX_VERSION).tar.gz
 SCX_VERSION_STAMP = $(BLDD)/scx.version
 
+# libBPF source
+LIBBPF_SRC = libbpf/src
+LIBBPF_A = $(BLDD)/lib/libbpf.a
+
 # Flags
 INCS = -I$(INCD) -I$(BLDD)/include
-LIBS = -lbpf
-CFLAGS = -Wall -Wextra -g
+LIBS = -lelf -lz
+CFLAGS = -Wall -g -Wno-unused-parameter
+DFLAGS = -g -DVERBOSE -DCOLOR
 
 .PRECIOUS: $(BLDD)/bpf/%.bpf.o $(BLDD)/include/%.skel.h $(BLDD)/include/scx/*.h
 
+# BUILD VERSION STAMP
+BUILD_VERSION_STAMP = $(BLDD)/version
+
+prod: BUILD_VERSION := prod
+prod: $(BIND)/$(TARGET)
+
+debug: BUILD_VERSION := debug
+debug: CFLAGS += $(DFLAGS)
+debug: $(BIND)/$(TARGET)
+
+.PHONY: FORCE
+$(BUILD_VERSION_STAMP): FORCE | $(BLDD)
+	@if [ "$$(cat $@ 2>/dev/null)" != "$(BUILD_VERSION)" ]; then \
+		echo "$(BUILD_VERSION)" > $@; \
+	fi
+
 # eBPF Scheduler Launcher
-$(BIND)/$(TARGET): $(OBJS) $(BLDD)/include/scx | $(BIND)
-	$(CC) $(CFLAGS) $(INCS) -o $@ $(OBJS) $(LIBS)
+$(BIND)/$(TARGET): $(OBJS) $(LIBBPF_A) | $(BIND)
+	$(CC) $(CFLAGS) $(INCS) -o $@ $(OBJS) $(LIBBPF_A) $(LIBS)
 
 # Build source files
-$(BLDD)/%.o: $(SRCD)/%.c $(SKELE) | $(BLDD)
+$(BLDD)/%.o: $(SRCD)/%.c $(BUILD_VERSION_STAMP) $(SKELE) $(LIBBPF_A) $(BLDD)/include/scx | $(BLDD)
 	$(CC) $(CFLAGS) $(INCS) -c $< -o $@ 
 
 # Build BPF files
 $(BLDD)/bpf/%.bpf.o: $(SRCD)/bpf/%.bpf.c $(BLDD)/include/vmlinux.h | $(BLDD)/bpf
-	$(CC) -g -O2 -target bpf -D__TARGET_ARCH_x86 -I$(BLDD)/include -c $< -o $@
+	$(CC) -g -O2 -target bpf -mcpu=v3 -D__TARGET_ARCH_x86 -I$(BLDD)/include -c $< -o $@
 
 # Create $(BLDD)/include/scx and unpack scx includes
 $(BLDD)/include/scx: $(BLDD)/scx.tar.gz | $(BLDD)/include
 	@mkdir $@
-	@tar -xzf $< --strip-components=4 -C $@ scx-$(shell cat $(SCX_VERSION_STAMP) 2> /dev/null)/scheds/include/scx
+	@tar -xzf $< --strip-components=4 -C $@ scx-$(shell cat $(SCX_VERSION_STAMP))/scheds/include/scx
+	@tar -xzf $< --strip-components=3 -C $(BLDD)/include --wildcards 'scx-$(shell cat $(SCX_VERSION_STAMP))/scheds/include/*.h'
 
 # Version stamp the fetch SCX
-.PHONY: FORCE
 $(SCX_VERSION_STAMP): FORCE | $(BLDD)
 	@if [ "$$(cat $@ 2>/dev/null)" != "$(SCX_VERSION)" ]; then \
 		echo "$(SCX_VERSION)" > $@; \
@@ -66,9 +87,18 @@ $(BLDD)/include/vmlinux.h: | $(BLDD)/include
 $(BLDD)/include/%.skel.h: $(BLDD)/bpf/%.bpf.o | $(BLDD)/include
 	bpftool gen skeleton $< > $@
 
+# Build libbpf
+$(LIBBPF_A): | $(BLDD)/lib
+	$(MAKE)	-C $(LIBBPF_SRC) BUILD_STATIC_ONLY=1
+	@mv $(LIBBPF_SRC)/libbpf.a $@
+
 # Create directories in build
-$(BLDD)/include $(BLDD)/bpf: | $(BLDD)
+$(BLDD)/lib $(BLDD)/bpf: | $(BLDD)
 	@mkdir $@
+
+$(BLDD)/include: | $(BLDD)
+	@mkdir $@
+	@ln -sfn $(abspath $(LIBBPF_SRC)) $(BLDD)/include/bpf
 
 # Create output directories
 $(BLDD) $(BIND):
@@ -76,7 +106,8 @@ $(BLDD) $(BIND):
 
 # Clean 
 clean:
-	@rm -rfv $(BLDD)
+	@rm -rfv $(BLDD)/include
+	@rm -rfv $(BLDD)/bpf
 	@rm -rfv $(BIND)
 
 .phony: clean
