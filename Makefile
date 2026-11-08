@@ -59,7 +59,7 @@ $(BLDD)/%.o: $(SRCD)/%.c $(BUILD_VERSION_STAMP) $(SKELE) $(LIBBPF_A) $(BLDD)/inc
 
 # Build BPF files
 $(BLDD)/bpf/%.bpf.o: $(SRCD)/bpf/%.bpf.c $(BLDD)/include/vmlinux.h | $(BLDD)/bpf
-	$(CC) -g -O2 -target bpf -mcpu=v3 -D__TARGET_ARCH_x86 -I$(BLDD)/include -c $< -o $@
+	$(CC) -g -O2 -target bpf -mcpu=v3 -D__TARGET_ARCH_x86 $(INCS) -c $< -o $@
 
 # Create $(BLDD)/include/scx and unpack scx includes
 $(BLDD)/include/scx: $(BLDD)/scx.tar.gz | $(BLDD)/include
