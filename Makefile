@@ -1,5 +1,5 @@
 CC = clang
-TARGET = sched
+TARGET = grid_sched
 
 # Directories
 SRCD = src
