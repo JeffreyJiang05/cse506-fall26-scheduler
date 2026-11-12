@@ -1,0 +1,367 @@
+/* Grid scheduler
+ * 
+ */
+
+#include <scx/common.bpf.h>
+
+#include "types.h"
+#include "stats.bpf.h"
+
+char _license[] SEC("license") = "GPL";
+UEI_DEFINE(uei);
+
+
+/**
+ * Data to be populated by userspace
+ */
+const volatile u32 nr_cpus; // Number of CPU cores
+const volatile u16 latency[GRID_NR_ROWS]; // Latency for each row in grid
+const volatile u16 slices[GRID_NR_COLS]; // Time slices for each column in grid
+const volatile u16 drr_quanta[GRID_NR_ROWS]; // Quanta for DRR
+
+#define for_each_cpu(cpu) for (u32 cpu = 0; cpu < nr_cpus; ++cpu) 
+
+/**
+ * eBPF Maps
+ */
+
+// per-Task data used in scheduling
+struct {
+	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, int);
+    __type(value, struct task_metadata);
+} grid_task_data SEC(".maps");
+
+static inline struct task_metadata *get_task_metadata(struct task_struct *p) {
+	return bpf_task_storage_get(&grid_task_data, p, &task_metadata_init, BPF_LOCAL_STORAGE_GET_F_CREATE);
+}
+
+// per-CPU data used in scheduling
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __type(key, u32);
+    __type(value, struct cpu_state);
+    __uint(max_entries, 1);
+} grid_cpu_state SEC(".maps");
+
+static inline struct cpu_state *get_cpu_state() {
+	u32 key = 0;
+	return bpf_map_lookup_elem(&grid_cpu_state, &key);
+}
+
+// SCX callbacks
+
+/**
+ * Scheduler initialization
+ */
+s32 BPF_STRUCT_OPS_SLEEPABLE(grid_init) {
+	// Hard-coded for now
+    bpf_printk("Initializing Grid Scheduler");
+	bpf_printk("Total number of cores: %u", nr_cpus);
+	bpf_printk("Latencies: [%u %u %u %u %u %u %u %u]", 
+		latency[0], latency[1], latency[2], latency[3],
+		latency[4], latency[5], latency[6], latency[7]);
+	bpf_printk("Time slices: [%u %u %u %u %u %u %u %u]", 
+		slices[0], slices[1], slices[2], slices[3],
+		slices[4], slices[5], slices[6], slices[7]);
+
+	// Set up initial per-task data for scheduler
+	task_metadata_initialize();
+
+	for_each_cpu(cpu) {
+		// create grid of DSQs for each CPU
+		for_each_cpu_dsq(id, cpu) {
+			if (scx_bpf_create_dsq(id, 0) < 0) {
+				bpf_printk("Failed to create DSQ #%ull (CPU = %ull, row = %ull, col = %ull)", 
+					id, GRID_DSQ_CPU(id), GRID_DSQ_ROW(id), GRID_DSQ_COL(id));
+				return -1;
+			}
+		}
+	}
+
+	bpf_printk("Spawned all DSQs successfully");
+	return 0;
+}
+
+/**
+ * Scheduler finalization
+ */
+void BPF_STRUCT_OPS(grid_exit, struct scx_exit_info *ei) {
+	// Destroy DSQs
+	for_each_cpu(cpu) {
+		for_each_cpu_dsq(id, cpu) {
+			scx_bpf_destroy_dsq(id);
+		}
+	}
+
+	bpf_printk("Terminating Grid Scheduler");
+	UEI_RECORD(uei, ei);
+}
+
+/**
+ * Scheduler enqueue onto DSQ
+ */
+void BPF_STRUCT_OPS(grid_enqueue, struct task_struct *p, u64 enq_flags) {
+	// bpf_printk("Enqueue is Called");
+	u32 cpu = bpf_get_smp_processor_id();
+
+	struct task_metadata *task_metadata = get_task_metadata(p);
+	if (!task_metadata) {
+		scx_bpf_error("Failed to allocate task metadata.");
+		return;
+	}
+
+	if (!is_task_metadata_initialized(task_metadata)) {
+		task_metadata->dsq_id = GRID_DSQ_ID(cpu, DEFAULT_ROW, DEFAULT_COL);
+	}
+
+	dsq_id_t dsq = task_metadata->dsq_id;
+	u32 row = GRID_DSQ_ROW(dsq);
+	u32 col = GRID_DSQ_COL(dsq);
+	dsq_id_t correct_dsq = GRID_DSQ_ID(cpu, row, col);
+	task_metadata->dsq_id = correct_dsq;
+
+	struct cpu_state *state = get_cpu_state();
+	state->summary |= DSQ_TO_SUMMARY(correct_dsq);
+	state->total_tasks++;
+	state->task_counters[GRID_DSQ_IDX(correct_dsq)]++;
+
+	scx_bpf_dsq_insert(p, correct_dsq, slices[col] * NS, 0);
+	// Set time the task is enqueued in ns
+	task_metadata->enqueue_time = bpf_ktime_get_ns();
+	// Set the timeslice of the DSQ in ns
+	task_metadata->timeslice_duration = slices[col] * NS;
+	// Set that the task is now on the queue
+	task_metadata->on_queue = true;
+} 
+
+/**
+ * Scheduler dequeue from DSQ
+ */
+void BPF_STRUCT_OPS(grid_dequeue, struct task_struct *p, u64 deq_flags) {
+	bpf_printk("Dequeue is Called");
+	struct task_metadata *task_metadata = get_task_metadata(p);
+
+	// If task is not initialized, then do nothing. Should not happen!
+	if (!task_metadata || !is_task_metadata_initialized(task_metadata)) {
+		return;
+	}
+
+	// If task is not on the queue, then do nothing
+	if (!task_metadata->on_queue) {
+		return;
+	}
+
+	// Otherwise, task was on the queue when dequeue is issued
+	// This is because the task is cancelled or properties has changed
+
+	// Update task to be marked as dequeued
+	task_metadata->on_queue = false;
+
+	dsq_id_t dsq = task_metadata->dsq_id;
+
+	u32 curr_cpu = bpf_get_smp_processor_id();
+	u32 task_cpu = GRID_DSQ_CPU(dsq);
+	bpf_printk("DEQ CPU %u GRID CPU %u", curr_cpu, task_cpu);
+	if (curr_cpu != task_cpu) {
+		bpf_printk("ERROR: ENQ CPU != DEQ CPU");
+	}
+
+	// Must update CPU state
+	struct cpu_state *state = get_cpu_state();
+	state->total_tasks--;
+	if (--state->task_counters[GRID_DSQ_IDX(dsq)] == 0) {
+		// Clear summary bit if (row,col) is no tasks on it
+		state->summary &= ~DSQ_TO_SUMMARY(dsq);
+	}
+}
+
+/**
+ * Scheduler dispatch
+ * Uses deficit round robin (DRR) between rows to ensure fairness
+ * Within a row, perform standard RR to ensure fairness
+ */
+/* void BPF_STRUCT_OPS(grid_dispatch, s32 cpu, struct task_struct *prev) {
+	struct cpu_state *state = get_cpu_state();
+
+	for (u32 row = 0; row < GRID_NR_ROWS; ++row) {
+		grid_summary_t row_summary = state->summary & grid_row_masks[row];
+
+		// If row_summary bits are all cleared, no tasks on the row
+		if (!row_summary) {
+			// Clear the deficit
+			state->rows[row].deficit = 0;
+		}
+		else {
+			// Increase the deficit with alloted quantum
+			state->rows[row].deficit += drr_quanta[row];
+
+			// Perform round robin in the row
+			u32 start_col = state->rows[row].next_col_sched;
+			row_summary >>= row * GRID_NR_COLS;
+			grid_summary_t rotate = (((row_summary << GRID_NR_COLS) | row_summary) >> start_col) & MASK(GRID_NR_COLS);
+
+			for (u32 i = 0; i < GRID_NR_COLS; ++i) {
+				// Terminate search early if none left
+				if (!rotate) break;
+
+				// Found a DSQ with a task waiting
+				if (rotate & 0x1) {
+					u32 col = (start_col + i) % GRID_NR_COLS;
+					u32 task_cost = slices[col];
+
+					// Check if task from row can be scheduled
+					if (state->rows[row].deficit >= task_cost) {
+						// Update row's DRR values
+						state->rows[row].deficit -= task_cost;
+						state->rows[row].next_col_sched = (col + 1) % GRID_NR_COLS;
+
+						// Schedule task
+						dsq_id_t dsq = GRID_DSQ_ID(cpu, row, col);
+						scx_bpf_dsq_move_to_local(dsq);
+						return;
+					}
+				}
+				rotate >>= 1;
+			}
+		}
+		
+	}
+} */
+
+
+// Handle cleaning cpu state here
+void BPF_STRUCT_OPS(grid_dispatch, s32 cpu, struct task_struct *prev) {
+	u32 custom_cpu = bpf_get_smp_processor_id();
+	if (custom_cpu != cpu) {
+		bpf_printk("current cpu %d != cpu argument %d", custom_cpu, cpu);
+	}
+
+    struct cpu_state *state = get_cpu_state();
+
+    // Fast path: if no tasks are queued anywhere, exit immediately.
+    if (!state->summary) {
+		return;
+	}
+
+    // Loop 2x the rows. If we end a row's turn and grant quantum to the next row 
+    // at the end of the list, we must wrap around to actually evaluate it.
+    for (u32 r = 0; r < GRID_NR_ROWS * 2; ++r) {
+
+        // Pick up exactly where we left off last time
+        u32 row = state->next_row_sched;
+		if (row >= GRID_NR_ROWS) {
+            row = 0;
+            state->next_row_sched = 0;
+        }
+
+        grid_summary_t row_summary = state->summary & grid_row_masks[row];
+
+        // 1. If row is empty, clear its deficit and move to the next row.
+        if (!row_summary) {
+            state->rows[row].deficit = 0;
+            state->next_row_sched = (row + 1) % GRID_NR_ROWS;
+            state->rows[state->next_row_sched].deficit += drr_quanta[state->next_row_sched];
+            continue;
+        }
+
+        // 2. Perform round robin in the columns to find the next task
+        u32 start_col = state->rows[row].next_col_sched;
+        row_summary >>= row * GRID_NR_COLS;
+        grid_summary_t rotate = (((row_summary << GRID_NR_COLS) | row_summary) >> start_col) & MASK(GRID_NR_COLS);
+
+        for (u32 i = 0; i < GRID_NR_COLS; ++i) {
+            if (!rotate) break;
+
+            if (rotate & 0x1) {
+                u32 col = (start_col + i) % GRID_NR_COLS;
+                u32 task_cost = slices[col];
+
+                // 3. DRR Check: Can we afford this task?
+                if (state->rows[row].deficit >= task_cost) {
+                    // YES: Deduct cost, update column, and dispatch.
+                    // Notice we do NOT change next_row_sched, so this row continues its turn next call!
+                    dsq_id_t dsq = GRID_DSQ_ID(cpu, row, col);
+                    if (scx_bpf_dsq_move_to_local(dsq)) {
+						bpf_printk("SCX_BPF_DSQ_MOVE_TO_LOCAL PASSED");
+						state->rows[row].deficit -= task_cost;
+					} else {
+						// bpf_printk("Attempting to move task from empty DSQ!");
+					}
+					state->rows[row].next_col_sched = (col + 1) % GRID_NR_COLS;
+                    return;
+                } else {
+                    // NO: This row's turn is over. Move to the next row.
+                    state->next_row_sched = (row + 1) % GRID_NR_ROWS;
+                    
+                    // Grant the DRR quantum to the newly active row
+                    state->rows[state->next_row_sched].deficit += drr_quanta[state->next_row_sched];
+                    
+                    // Break out of the column loop so the outer loop evaluates the new row
+                    break;
+                }
+            }
+            rotate >>= 1;
+        }
+    }
+
+	bpf_printk("Failed to dispatch for CPU #%d", cpu);
+}
+
+/**
+ * Scheduler running
+ */
+void BPF_STRUCT_OPS(grid_running, struct task_struct *p) {
+	struct task_metadata *task_metadata = get_task_metadata(p);
+	if (task_metadata) {
+		task_metadata->timeslice_start = bpf_ktime_get_ns();
+		task_metadata->on_queue = false;
+	}
+}
+
+/**
+ * Scheduler stopping
+ */
+void BPF_STRUCT_OPS(grid_stopping, struct task_struct *p, bool runnable) {
+	struct task_metadata *task_metadata = get_task_metadata(p);
+	if (!task_metadata) return;
+
+	// Compute time running
+	u64 now = bpf_ktime_get_ns();
+	s64 delta = time_delta(now, task_metadata->timeslice_start); // in NS
+
+	dsq_id_t old_dsq = task_metadata->dsq_id;
+	u32 old_col = GRID_DSQ_COL(old_dsq);
+	u32 old_row = GRID_DSQ_ROW(old_dsq);
+
+	u32 new_col = old_col;
+	u32 new_row = old_row;
+
+	if (!runnable) {
+		if (p->scx.slice >= task_metadata->timeslice_duration / 2) {
+			// Task only used half of its timeslice before yielding
+			// Decrease the time slice given to the process
+			new_col = DEC_COL(old_col);
+		}
+		else if (p->scx.slice == 0) {
+			// Task used entire time slice and still can run,
+			// Increaes the time slice given to the process
+			new_col = INC_COL(old_col); 
+		}
+	}
+	// Otherwise, the task was preempted. Cannot make any judgement
+
+	u32 cpu = GRID_DSQ_CPU(old_dsq);
+	task_metadata->dsq_id = GRID_DSQ_ID(cpu, new_row, new_col);
+}
+
+SCX_OPS_DEFINE(grid_ops,
+	       .init 		= (void*) grid_init,
+	       .exit 		= (void*) grid_exit,
+		   .enqueue 	= (void*) grid_enqueue,
+		   .dequeue 	= (void*) grid_dequeue,
+		   .dispatch 	= (void*) grid_dispatch,
+		   .running 	= (void*) grid_running,
+		   .stopping 	= (void*) grid_stopping,
+	       .name = "grid");

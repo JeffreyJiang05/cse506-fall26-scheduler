@@ -25,10 +25,11 @@ static const char help_msg[] =
 static volatile sig_atomic_t exit_flag = 0;
 static const __u16 default_latencies[GRID_NR_ROWS] = { 1, 2, 3, 5, 8, 13, 21, 34 };
 static const __u16 default_slices[GRID_NR_COLS] = { 1, 2, 4, 8, 16, 32, 64, 128 };
+static const __u16 default_drr[GRID_NR_ROWS] = { 128, 128, 128, 128, 128, 128, 128, 128 };
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
 {
-#ifdef SCX_DEBUG
+#ifdef DEBUG
     return vfprintf(stderr, format, args);
 #else
     return 0;
@@ -60,11 +61,12 @@ static void install_signal_handlers() {
 struct sched_args {
     char *latency_config_filename;
     char *slice_config_filename;
+    char *drr_config_filename;
 };
 
 static void process_args(int argc, char *argv[], struct sched_args *out) {
     __u32 opt;
-    while ((opt = getopt(argc, argv, "l:q:h")) != -1) {
+    while ((opt = getopt(argc, argv, "l:q:d:h")) != -1) {
         switch (opt) {
         case 'l':
             out->latency_config_filename = optarg;
@@ -73,6 +75,10 @@ static void process_args(int argc, char *argv[], struct sched_args *out) {
         case 'q':
             out->slice_config_filename = optarg;
             info("Time slice config input file: %s", out->slice_config_filename);
+            break;
+        case 'd':
+            out->drr_config_filename = optarg;
+            info("DRR quanta config input file: %s", out->drr_config_filename);
             break;
         case 'h':
             DISPLAY_HELP_MSG(stdout, argv[0]);
@@ -162,15 +168,33 @@ static void configure_timeslices(struct grid_bpf *skel, char *slices_file) {
     if (file) fclose(file);
 }
 
+static void configure_drr_quanta(struct grid_bpf *skel, char *drr_file) {
+    if (!drr_file) {
+        info("No supplied DRR quanta configuration file. Using default");
+        memcpy(&skel->rodata->drr_quanta[0], &default_drr[0], sizeof(default_drr[0]) * GRID_NR_ROWS);
+        return;
+    }
+
+    FILE *file = fopen(drr_file, "r");
+    if (!file || parse_file(file, GRID_NR_ROWS, ":", &skel->rodata->drr_quanta[0]) == -1) {
+        warn("Problem handling %s (either problem with the file or file format). Resorting to default", drr_file);
+        memcpy(&skel->rodata->drr_quanta[0], &default_drr[0], sizeof(default_drr[0]) * GRID_NR_ROWS);
+    }
+    if (file) fclose(file);
+}
+
 static void configure_scheduler(struct grid_bpf *skel, struct sched_args *args) {
     skel->rodata->nr_cpus = libbpf_num_possible_cpus();
     configure_latency(skel, args->latency_config_filename);
     configure_timeslices(skel, args->slice_config_filename);
+    configure_drr_quanta(skel, args->drr_config_filename);
+    
 
     info(" === SCHEDULER CONFIGURATION BEGIN ===");
     info(" NR_CPUS = %u", skel->rodata->nr_cpus);
     for (int i = 0; i < GRID_NR_ROWS; ++i) info(" LATENCY[%d] = %u", i, skel->rodata->latency[i]);
     for (int i = 0; i < GRID_NR_COLS; ++i) info(" SLICE[%d] = %u", i, skel->rodata->slices[i]);
+    for (int i = 0; i < GRID_NR_ROWS; ++i) info(" DRR_QUANTUM[%d] = %u", i, skel->rodata->drr_quanta[i]);
     info(" === SCHEDULER CONFIGURATION END ===");
 }
 

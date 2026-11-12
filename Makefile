@@ -30,6 +30,7 @@ INCS = -I$(INCD) -I$(BLDD)/include
 LIBS = -lelf -lz
 CFLAGS = -Wall -g -Wno-unused-parameter
 DFLAGS = -g -DVERBOSE -DCOLOR
+BPF_FLAGS = 
 
 .PRECIOUS: $(BLDD)/bpf/%.bpf.o $(BLDD)/include/%.skel.h $(BLDD)/include/scx/*.h
 
@@ -41,6 +42,7 @@ prod: $(BIND)/$(TARGET)
 
 debug: BUILD_VERSION := debug
 debug: CFLAGS += $(DFLAGS)
+debug: BPF_FLAGS += $(DFLAGS)
 debug: $(BIND)/$(TARGET)
 
 .PHONY: FORCE
@@ -59,7 +61,7 @@ $(BLDD)/%.o: $(SRCD)/%.c $(BUILD_VERSION_STAMP) $(SKELE) $(LIBBPF_A) $(BLDD)/inc
 
 # Build BPF files
 $(BLDD)/bpf/%.bpf.o: $(SRCD)/bpf/%.bpf.c $(BLDD)/include/vmlinux.h | $(BLDD)/bpf
-	$(CC) -g -O2 -target bpf -mcpu=v3 -D__TARGET_ARCH_x86 $(INCS) -c $< -o $@
+	$(CC) -g -O2 -target bpf -mcpu=v3 -D__TARGET_ARCH_x86 $(BPF_FLAGS) $(INCS) -c $< -o $@
 
 # Create $(BLDD)/include/scx and unpack scx includes
 $(BLDD)/include/scx: $(BLDD)/scx.tar.gz | $(BLDD)/include
