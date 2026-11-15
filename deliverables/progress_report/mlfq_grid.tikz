@@ -1,0 +1,64 @@
+\begin{tikzpicture}[
+    scale=0.85, transform shape, % Scales down the entire diagram
+    queue node/.style={draw, minimum width=0.6cm, minimum height=0.4cm, anchor=center, font=\scriptsize\ttfamily},
+    axis arrow/.style={-{Latex[length=2.5mm]}, thick},
+    grid node/.style={draw, minimum width=0.8cm, minimum height=0.4cm, anchor=center, font=\scriptsize\ttfamily}
+]
+    % Define the grid
+    \matrix (mat) [
+        matrix of nodes,
+        nodes={grid node},
+        column sep=-\pgflinewidth,
+        row sep=-\pgflinewidth,
+        nodes in empty cells=false
+    ] {
+        |[name=m00]| [00] & |[name=m01]| [01] & |[name=m02]| [02] & |[name=m03]| [03] & |[name=m04]| [04] & |[name=m05]| [05] & |[name=m06]| [06] & |[name=m07]| [07] \\
+        |[name=m10]| [10] & |[name=m11]| [11] & |[name=m12]| [12] & |[name=m13]| [13] & |[name=m14]| [14] & |[name=m15]| [15] & |[name=m16]| [16] & |[name=m17]| [17] \\
+        |[name=m20]| [20] & |[name=m21]| [21] & |[name=m22]| [22] & |[name=m23]| [23] & |[name=m24]| [24] & |[name=m25]| [25] & |[name=m26]| [26] & |[name=m27]| [27] \\
+        |[name=m30]| [30] & |[name=m31]| [31] & |[name=m32]| [32] & |[name=m33]| [33] & |[name=m34]| [34] & |[name=m35]| [35] & |[name=m36]| [36] & |[name=m37]| [37] \\
+        |[name=m40]| [40] & |[name=m41]| [41] & |[name=m42]| [42] & |[name=m43]| [43] & |[name=m44]| [44] & |[name=m45]| [45] & |[name=m46]| [46] & |[name=m47]| [47] \\
+        |[name=m50]| [50] & |[name=m51]| [51] & |[name=m52]| [52] & |[name=m53]| [53] & |[name=m54]| [54] & |[name=m55]| [55] & |[name=m56]| [56] & |[name=m57]| [57] \\
+        |[name=m60]| [60] & |[name=m61]| [61] & |[name=m62]| [62] & |[name=m63]| [63] & |[name=m64]| [64] & |[name=m65]| [65] & |[name=m66]| [66] & |[name=m67]| [67] \\
+        |[name=m70]| [70] & |[name=m71]| [71] & |[name=m72]| [72] & |[name=m73]| [73] & |[name=m74]| [74] & |[name=m75]| [75] & |[name=m76]| [76] & |[name=m77]| [77] \\
+    };
+
+    % X-axis labels (Quanta) - Moved to top
+    \node [above=0.05cm of m00, font=\scriptsize\ttfamily] {$t_0$};
+    \node [above=0.05cm of m01, font=\scriptsize\ttfamily] {$t_1$};
+    \node [above=0.05cm of m02, font=\scriptsize\ttfamily] {$t_2$};
+    \node [above=0.05cm of m03, font=\scriptsize\ttfamily] {$t_3$};
+    \node [above=0.05cm of m04, font=\scriptsize\ttfamily] {$t_4$};
+    \node [above=0.05cm of m05, font=\scriptsize\ttfamily] {$t_5$};
+    \node [above=0.05cm of m06, font=\scriptsize\ttfamily] {$t_6$};
+    \node [above=0.05cm of m07, font=\scriptsize\ttfamily] {$t_7$};
+    
+    % Quanta Arrow - Moved to top
+    \draw[axis arrow] ([xshift=0.15cm, yshift=0.4cm]mat.north west) -- ([xshift=0.2cm, yshift=0.4cm]mat.north east) node[midway, above, font=\sffamily\bfseries\scriptsize] {Time Slice};
+
+    % Y-axis labels (Latency)
+    \node [left=0.1cm of m00, font=\scriptsize\ttfamily] {$l_0$};
+    \node [left=0.1cm of m10, font=\scriptsize\ttfamily] {$l_1$};
+    \node [left=0.1cm of m20, font=\scriptsize\ttfamily] {$l_2$};
+    \node [left=0.1cm of m30, font=\scriptsize\ttfamily] {$l_3$};
+    \node [left=0.1cm of m40, font=\scriptsize\ttfamily] {$l_4$};
+    \node [left=0.1cm of m50, font=\scriptsize\ttfamily] {$l_5$};
+    \node [left=0.1cm of m60, font=\scriptsize\ttfamily] {$l_6$};
+    \node [left=0.1cm of m70, font=\scriptsize\ttfamily] {$l_7$};
+    
+    % Latency Arrow
+    \draw[axis arrow] ([xshift=-0.5cm, yshift=-0.15cm]mat.north west) -- ([xshift=-0.5cm, yshift=-0.2cm]mat.south west) node[midway, above, rotate=90, font=\sffamily\bfseries\scriptsize] {Latency Requirements};
+
+    % Quanta for Deficit Round Robin
+    \node [right=0.15cm of m07, font=\scriptsize\ttfamily] {$q_0$};
+    \node [right=0.15cm of m17, font=\scriptsize\ttfamily] {$q_1$};
+    \node [right=0.15cm of m27, font=\scriptsize\ttfamily] {$q_2$};
+    \node [right=0.15cm of m37, font=\scriptsize\ttfamily] {$q_3$};
+    \node [right=0.15cm of m47, font=\scriptsize\ttfamily] {$q_4$};
+    \node [right=0.15cm of m57, font=\scriptsize\ttfamily] {$q_5$};
+    \node [right=0.15cm of m67, font=\scriptsize\ttfamily] {$q_6$};
+    \node [right=0.15cm of m77, font=\scriptsize\ttfamily] {$q_7$};
+
+    % DRR Quanta Label
+    \draw[axis arrow, draw=none] ([xshift=0.5cm, yshift=0cm]mat.north east) -- ([xshift=0.5cm, yshift=0cm]mat.south east) node[midway, above, rotate=-90, font=\sffamily\bfseries\scriptsize] {Deficit Round Robin Quantum};
+
+\end{tikzpicture}
