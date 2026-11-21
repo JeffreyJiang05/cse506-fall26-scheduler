@@ -13,8 +13,8 @@ typedef u64 dsq_id_t;
 /** 
  * Compute DSQ ID based on the CPU, row, and column 
  */
-#define GRID_DSQ_COORD(row, col) ((dsq_id_t) (((row) << COL_BITS) | (col)))
-#define GRID_DSQ_ID(cpu, coord) ((dsq_id_t) (((cpu) << (ROW_BITS + COL_BITS)) | (coord)))
+#define GRID_DSQ_COORD(row, col) ((dsq_id_t) ((((dsq_id_t)(row)) << COL_BITS) | (col)))
+#define GRID_DSQ_ID(cpu, coord) ((dsq_id_t) ((((dsq_id_t)(cpu)) << (ROW_BITS + COL_BITS)) | (coord)))
 
 
 // Calculate row, column, and CPU a DSQ belongs to based on its ID
@@ -51,10 +51,10 @@ typedef u32 grid_summary_t;
 typedef u64 grid_summary_t;
 #endif
 
-#define SUMMARY_ROW_COL(row, col) ((grid_summary_t) (1 << (((row) << COL_BITS) | (col))))
-#define DSQ_TO_SUMMARY(id) ((grid_summary_t) (1 << GRID_DSQ_IDX(id)))
-#define SUMMARY_COL_MASK(col) ((grid_summary_t) ((MASK(GRID_NR_ROWS * GRID_NR_COLS) / MASK(GRID_NR_ROWS)) << (col)))
-#define SUMMARY_ROW_MASK(row) ((grid_summary_t) (MASK(GRID_NR_ROWS)) << ((row) * GRID_NR_COLS))
+#define SUMMARY_ROW_COL(row, col) ((grid_summary_t) (1ULL << ((((dsq_id_t)(row)) << COL_BITS) | (col))))
+#define DSQ_TO_SUMMARY(id) ((grid_summary_t) (1ULL << GRID_DSQ_IDX(id)))
+#define SUMMARY_COL_MASK(col) ((grid_summary_t) ((MASK(GRID_NR_ROWS * GRID_NR_COLS) / MASK(GRID_NR_COLS)) << (col)))
+#define SUMMARY_ROW_MASK(row) ((grid_summary_t) (MASK(GRID_NR_COLS)) << (((dsq_id_t)(row)) * GRID_NR_COLS))
 
 // Define array of constants for quick runtime access
 
@@ -70,6 +70,36 @@ static const grid_summary_t grid_col_masks[GRID_NR_COLS] = {
 };
 #undef GRID_COL_MASK_ARR_TEMPLATE
 
+/*
+ * Syscall sleep classification flags for Y-axis row placement.
+ * Lower flag values map to lower row indices (higher latency priority).
+ */
+enum sleep_flag {
+	SLEEP_FLAG_NONE     = 0,  /* No sleep event recorded (use default row) */
+	SLEEP_FLAG_FUTEX    = 1,  /* Synchronization primitive (highest priority) */
+	SLEEP_FLAG_POLL     = 2,  /* Event polling (epoll, poll, select) */
+	SLEEP_FLAG_READ     = 3,  /* Blocking read I/O */
+	SLEEP_FLAG_WRITE    = 4,  /* Blocking write I/O */
+	SLEEP_FLAG_SLEEP    = 5,  /* Explicit sleep (nanosleep, clock_nanosleep) */
+	SLEEP_FLAG_OTHER    = 6,  /* Any other blocking syscall */
+	SLEEP_FLAG_MAX      = 7,  /* Sentinel / CPU-bound default */
+};
+
+/*
+ * Row mapping from sleep flag.
+ * sleep_flag_to_row[flag] gives the row index i for the task.
+ */
+static const u32 sleep_flag_to_row[8] = {
+	[SLEEP_FLAG_NONE]   = DEFAULT_ROW,
+	[SLEEP_FLAG_FUTEX]  = 0,  /* Critical sync → row 0 (highest priority) */
+	[SLEEP_FLAG_POLL]   = 1,  /* Interactive I/O polling → row 1 */
+	[SLEEP_FLAG_READ]   = 2,  /* Blocking read → row 2 */
+	[SLEEP_FLAG_WRITE]  = 3,  /* Blocking write → row 3 */
+	[SLEEP_FLAG_SLEEP]  = 5,  /* Explicit sleep → row 5 */
+	[SLEEP_FLAG_OTHER]  = 6,  /* Misc blocking → row 6 */
+	[SLEEP_FLAG_MAX]    = 7,  /* CPU-bound → row 7 (lowest priority) */
+};
+
 // Metadata in 2D grid
 struct task_metadata {
 	bool on_queue;
@@ -81,6 +111,8 @@ struct task_metadata {
 	u64 timeslice_start;
 	// duration of timeslice
 	u64 timeslice_duration;
+	// Syscall classification flag set by tracepoint handlers
+	u32 sleep_flag;
 };
 
 #define INIT_BPF_DSQ_ID SCX_DSQ_GLOBAL
@@ -90,7 +122,8 @@ static struct task_metadata task_metadata_init = {
 	.dsq_id = 0,
 	.enqueue_time = 0,
 	.timeslice_start = 0,
-	.timeslice_duration = 0
+	.timeslice_duration = 0,
+	.sleep_flag = SLEEP_FLAG_NONE
 };
 
 // helper functions/macros
@@ -125,22 +158,36 @@ struct cpu_state {
 #define cpu_state_row_metadata(cpu_state, row) ((cpu_state)->rows[(row)])
 
 static inline void cpu_state_enq_task(struct cpu_state *cpu_state, dsq_id_t dsq) {
+	u32 idx = GRID_DSQ_IDX(dsq);
 	grid_summary_t dsq_bitmask = DSQ_TO_SUMMARY(dsq);
-	// Update the summary bitmask
-	cpu_state->summary |= dsq_bitmask;
-	// Increment the counter of the # of task in the DSQ
-	cpu_state->task_counters[GRID_DSQ_IDX(dsq)]++;
-	// Increment total number of tasks
-	cpu_state->total_tasks++;
+
+	__sync_fetch_and_or(&cpu_state->summary, dsq_bitmask);
+	__sync_fetch_and_add(&cpu_state->task_counters[idx], 1);
+	__sync_fetch_and_add(&cpu_state->total_tasks, 1);
 }
 
 static inline void cpu_state_deq_task(struct cpu_state *cpu_state, dsq_id_t dsq) {
-	// Decrement the total number of tasks
-	cpu_state->total_tasks--;
-	// Decrement the task counter for the DSQ
-	if (--cpu_state->task_counters[GRID_DSQ_IDX(dsq)] == 0) {
-		// Clear summary bit if (row,col) is no tasks on it
-		cpu_state->summary &= ~DSQ_TO_SUMMARY(dsq);
+	u32 idx = GRID_DSQ_IDX(dsq);
+
+	/* Underflow protection for total_tasks */
+	if (cpu_state->total_tasks > 0) {
+		__sync_fetch_and_sub(&cpu_state->total_tasks, 1);
+	}
+
+	/* Underflow protection for task_counters */
+	if (cpu_state->task_counters[idx] > 0) {
+		u32 prev = __sync_fetch_and_sub(&cpu_state->task_counters[idx], 1);
+		if (prev == 1) {
+			/* Counter reached 0: atomically clear summary bit */
+			__sync_fetch_and_and(&cpu_state->summary, ~DSQ_TO_SUMMARY(dsq));
+			u32 row = GRID_DSQ_ROW(dsq);
+			if (row < GRID_NR_ROWS && !(cpu_state->summary & grid_row_masks[row])) {
+				cpu_state->rows[row].deficit = 0;
+			}
+		}
+	} else {
+		/* Counter was already 0: ensure summary bit is cleared if set */
+		__sync_fetch_and_and(&cpu_state->summary, ~DSQ_TO_SUMMARY(dsq));
 	}
 }
 

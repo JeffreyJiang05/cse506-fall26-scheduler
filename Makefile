@@ -27,7 +27,7 @@ LIBBPF_A = $(BLDD)/lib/libbpf.a
 
 # Flags
 INCS = -I$(INCD) -I$(BLDD)/include
-LIBS = -lelf -lz
+LIBS = -lelf -lz -lncursesw
 CFLAGS = -Wall -g -Wno-unused-parameter
 DFLAGS = -g -DVERBOSE -DCOLOR
 BPF_FLAGS = 
