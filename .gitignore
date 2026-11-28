@@ -3,4 +3,5 @@ bin/
 config/
 logs/
 old/
+benchamrks/data
 *.csv
