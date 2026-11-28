@@ -68,12 +68,13 @@ struct task_metadata {
 
 ### Atomic Synchronization & Concurrency Invariants
 
-To avoid phantom occupancy bits, counter underflows, and race conditions between concurrent enqueues, dispatches, and remote work stealing:
+To avoid phantom occupancy bits, counter underflows, and race conditions between concurrent enqueues, dispatches, remote work stealing, and task placement:
 
 1. **Strict Enqueue Ordering:** In `grid_enqueue`, tasks are physically inserted into the kernel DSQ via `scx_bpf_dsq_insert` **before** the occupancy bit is set in `state->summary`. This guarantees that any core observing a set bit in `summary` will never encounter an empty DSQ.
 2. **Atomic Counter-First Update:** When setting occupancy, `cpu_state_enq_task` increments `task_counters[coord]` and `total_tasks` using atomic additions (`__sync_fetch_and_add`) before asserting the bit in `summary` (`__sync_fetch_and_or`).
-3. **Underflow-Safe Atomic Dequeue with Double-Check:** `cpu_state_deq_task` decrements `task_counters[coord]` using an atomic Compare-And-Swap (`__sync_val_compare_and_swap`) loop. When the counter transitions from $1 \to 0$, it atomically clears the bit in `summary` (`__sync_fetch_and_and`). It then performs a double-check on `task_counters[coord] > 0`: if a concurrent enqueue incremented the counter in the interleaved window, the bit is immediately reasserted to heal the bitmap.
-4. **Row Deficit Reset on Empty:** When all cells in row $i$ become empty (`!(summary & grid_row_masks[i])`), the row's accumulated deficit is reset to 0 to prevent stale credit carry-over.
+3. **Underflow-Safe Atomic Dequeue with Double-Check:** `cpu_state_deq_task` decrements `task_counters[coord]` and `total_tasks` using atomic Compare-And-Swap (`__sync_val_compare_and_swap`) loops. When the cell counter transitions from $1 \to 0$, it atomically clears the bit in `summary` (`__sync_fetch_and_and`). It then performs a double-check on `task_counters[coord] > 0`: if a concurrent enqueue incremented the counter in the interleaved window, the bit is immediately reasserted to heal the bitmap.
+4. **Local-Only Row Deficit Mutation:** Per-row scheduling state (`rows[row].deficit` and `rows[row].next_col_sched`) is exclusively mutated by the local CPU in `grid_dispatch`. Remote CPUs executing `cpu_state_deq_task` during work stealing or re-enqueue cleanup only touch atomic counters (`task_counters`, `total_tasks`, `summary`) and never write to `rows`, completely eliminating cross-CPU data races on DRR deficits.
+5. **Cross-CPU Read Safety:** In cross-core operations (`grid_select_cpu` and `try_work_steal`), remote metrics (`total_tasks`, `summary`, `next_row_sched`) are loaded using atomic relaxed reads (`READ_ONCE`), preventing compiler tearing and cache incoherencies.
 
 ---
 
@@ -189,41 +190,52 @@ To prevent task starvation and comply with eBPF's strict 30-second runnable task
 
 ### Task Lifecycle & Preemption Rules
 
-1. **Deschedule Event (`grid_stopping`):**
+1. **Initial Task Placement & Wakeup Selection (`grid_select_cpu`):**
+   * Triggered when a task wakes up or is newly created/forked.
+   * Scans all online CPUs starting from `prev_cpu` to find the CPU with the fewest runnable tasks currently in its dispatch grid:
+     $$\text{target\_cpu} = \arg\min_{c \in \text{cpus\_allowed}(p)} (\text{state}_c\to\text{total\_tasks})$$
+   * **Cache Locality Tie-Breaking:** Starting the ring probe at `prev_cpu` ensures that if `prev_cpu` is tied for the minimum load (e.g. 0 tasks), the task remains on its previous CPU to preserve cache warmth.
+   * **Affinity Masking:** Validates candidate CPUs against `p->cpus_ptr->bits` using `task_can_run_on_cpu`.
+   * **Atomic Read:** Reads each candidate core's `total_tasks` using `READ_ONCE` to prevent compiler tearing and memory inconsistency.
+2. **Deschedule Event (`grid_stopping`):**
    * Computes actual execution duration $T = \text{now} - \text{timeslice\_start}$.
    * Applies X-axis feedback to compute $c_{next}$.
    * Assigns task to current local CPU: $\text{dsq\_id} = \text{GRID\_DSQ\_ID}(\text{cpu}, \text{GRID\_DSQ\_COORD}(i_{next}, c_{next}))$.
    * If `runnable` is true, reports `EVENT_TASK_PREEMPT`.
-2. **Enqueue Event (`grid_enqueue`):**
-   * If `task_metadata->on_queue` is already true (re-enqueue without dequeue), handles state consistency.
+3. **Enqueue Event (`grid_enqueue`):**
+   * Resolves target CPU: reads `scx_bpf_task_cpu(p)` (the CPU selected by `grid_select_cpu`).
+   * If `task_metadata->on_queue` is already true (re-enqueue without dequeue), handles state consistency via `cpu_state_deq_task` on `prev_cpu`.
    * If waking up (`SCX_ENQ_WAKEUP`), updates row $i$ based on `sleep_flag`.
    * Sets timeslice quantum: $t_c = \text{slices}[c] \times 10^6\text{ ns}$.
-   * Inserts task into kernel DSQ via `scx_bpf_dsq_insert(p, dsq, t_c, 0)`.
-   * Updates CPU summary bitmap and task counters via `cpu_state_enq_task`.
-   * Evaluates Wakeup Preemption.
-3. **Wakeup Preemption Trigger:**
-   * When a waking task is enqueued with target latency $l_{wake}$ and row $i_{wake}$:
+   * Inserts task into target CPU's DSQ via `scx_bpf_dsq_insert(p, dsq, t_c, 0)`.
+   * Updates target CPU summary bitmap and task counters via `cpu_state_enq_task`.
+   * **Remote Core Wakeup:** If `target_cpu != bpf_get_smp_processor_id()`, sends a kick IPI via `scx_bpf_kick_cpu(target_cpu, 0)` so the remote core immediately dispatches the newly assigned task.
+   * Evaluates Wakeup Preemption for locally enqueued tasks.
+4. **Wakeup Preemption Trigger:**
+   * When a waking task is enqueued on the local core with target latency $l_{wake}$ and row $i_{wake}$:
    * Evaluates the currently executing task `curr` on that CPU.
-   * Issues preemption (`scx_bpf_kick_cpu(cpu)`) if and only if:
+   * Issues preemption (`scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT)`) if and only if:
      $$i_{wake} < i_{curr} \quad \land \quad T_{rem} > l_{wake}$$
      where $T_{rem} = t_{curr\_slice} - (\text{now} - t_{curr\_start})$.
-4. **Dispatch Event (`grid_dispatch`):**
+5. **Dispatch Event (`grid_dispatch`):**
    * If `state->summary == 0`, invokes `try_work_steal`.
    * Otherwise, executes DRR inter-row selection and RR intra-row selection.
    * Moves task to CPU local queue via `scx_bpf_dsq_move_to_local(dsq)`.
    * Deducts cost from row deficit, decrements counters via `cpu_state_deq_task`, advances row and column pointers, and reports `EVENT_TASK_DISPATCH`.
-5. **Running Event (`grid_running`):**
+6. **Running Event (`grid_running`):**
    * Records execution start timestamp: `timeslice_start = bpf_ktime_get_ns()`.
    * Clears `on_queue = false`.
    * Re-associates `dsq_id` with local processor ID.
 
 ---
 
-## Multi-Core Load Balancing & Work Stealing
+## Multi-Core Load Balancing: Push Placement & Pull Stealing
 
-When a CPU's dispatch grid contains no runnable tasks (`state->summary == 0`), it enters the multi-core work stealing subsystem (`try_work_steal`).
+The scheduler enforces a complementary dual-strategy load balancing architecture:
+1. **Push Placement (`grid_select_cpu`):** Proactively places waking and newly spawned processes onto the least-loaded CPU grid, preventing initial core clustering.
+2. **Pull Stealing (`try_work_steal`):** Reactively allows idle cores to steal work from busy cores when their own grids run empty.
 
-### Full-Topology Ring Probe
+### Full-Topology Ring Probe (Work Stealing)
 
 * **Traversal:** The idle core probes remote cores in round-robin sequence starting from $(\text{cpu} + 1) \pmod N$ across all online cores ($N = \text{nr\_cpus}$, bounded to 64).
 * **Instant Rejection of Idle Cores:** The probing core inspects the remote core's 64-bit `remote->summary` bitmap in a single memory lookup. Cores with `remote->summary == 0` are bypassed immediately without inspecting queues.
@@ -283,36 +295,39 @@ EVENT [38223020333870]: TASK_MIGRATE    pid=0 src_cpu=0 dst_cpu=1 dsq=0x1b (targ
 ### State Machine Lifecycle
 
 ```
-             ┌─────────────────────────────────────────────────────────┐
-             │                                                         │
-             ▼                                                         │
-      [ WAKEUP / FORK ]                                                │
-             │                                                         │
-             ▼                                                         │
-      grid_enqueue() ──► scx_bpf_dsq_insert() ──► cpu_state_enq_task() │
-             │                                                         │
-             ▼                                                         │
-      [ RUNNABLE IN DSQ ] ◄─────────────────┐                          │
-             │                              │                          │
-             ▼                              │                          │
-      grid_dispatch() / try_work_steal()    │                          │
-             │                              │                          │
-             ▼                              │                          │
-      scx_bpf_dsq_move_to_local()           │                          │
-      cpu_state_deq_task()                  │                          │
-             │                              │                          │
-             ▼                              │                          │
-      grid_running()                        │                          │
-             │                              │                          │
-             ▼                              │                          │
-      [ EXECUTING ON CPU ]                  │                          │
-             │                              │                          │
-             ▼                              │                          │
-      grid_stopping()                       │                          │
-             │                              │                          │
-             ├──────── (Preempted / Expired)┘                          │
-             │                                                         │
-             └──────── (Blocked / Sleeping) ───────────────────────────┘
+             ┌────────────────────────────────────────────────────────────────────────┐
+             │                                                                        │
+             ▼                                                                        │
+      [ WAKEUP / FORK ]                                                               │
+             │                                                                        │
+             ▼                                                                        │
+      grid_select_cpu()                                                               │
+             │                                                                        │
+             ▼                                                                        │
+      grid_enqueue() ──► scx_bpf_dsq_insert() ──► cpu_state_enq_task() ──► [kick_cpu] │
+             │                                                                        │
+             ▼                                                                        │
+      [ RUNNABLE IN DSQ ] ◄─────────────────┐                                         │
+             │                              │                                         │
+             ▼                              │                                         │
+      grid_dispatch() / try_work_steal()    │                                         │
+             │                              │                                         │
+             ▼                              │                                         │
+      scx_bpf_dsq_move_to_local()           │                                         │
+      cpu_state_deq_task()                  │                                         │
+             │                              │                                         │
+             ▼                              │                                         │
+      grid_running()                        │                                         │
+             │                              │                                         │
+             ▼                              │                                         │
+      [ EXECUTING ON CPU ]                  │                                         │
+             │                              │                                         │
+             ▼                              │                                         │
+      grid_stopping()                       │                                         │
+             │                              │                                         │
+             ├──────── (Preempted / Expired)┘                                         │
+             │                                                                        │
+             └──────── (Blocked / Sleeping) ──────────────────────────────────────────┘
 ```
 
 ### Core Invariants
@@ -322,3 +337,4 @@ EVENT [38223020333870]: TASK_MIGRATE    pid=0 src_cpu=0 dst_cpu=1 dsq=0x1b (targ
 3. **Queue Insertion Before Visibility:** A task is always inserted into `scx_bpf_dsq_insert` before `summary` or `task_counters` indicate occupancy.
 4. **Bounded DRR Deficit:** For all rows $i \in [0, 7]$, $\text{deficit}_i \in [0, q_i + 128]$. Deficit is strictly 0 whenever row $i$ has no runnable tasks.
 5. **Work Stealing Safety:** A core failing to steal a task due to CPU affinity never mutates the target CPU's summary bitmap or DRR deficit.
+6. **Cross-CPU Isolation & Data Race Freedom:** Remote cores performing initial placement (`grid_select_cpu`), work stealing (`try_work_steal`), or remote enqueues (`grid_enqueue`) operate strictly on atomic fields (`total_tasks`, `task_counters`, `summary`) using `READ_ONCE` and atomic RMW instructions. Remote cores never mutate or read another CPU's private DRR scheduling state (`rows`, `next_row_sched`).

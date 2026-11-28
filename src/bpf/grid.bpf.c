@@ -235,6 +235,67 @@ void BPF_STRUCT_OPS(grid_exit, struct scx_exit_info *ei) {
 }
 
 /**
+ * Checks whether a task is permitted to run on a given CPU based on its affinity mask.
+ */
+static inline bool task_can_run_on_cpu(struct task_struct *p, u32 cpu) {
+    const cpumask_t *cpus_ptr = BPF_CORE_READ(p, cpus_ptr);
+    if (!cpus_ptr)
+        return true;
+    u32 word = cpu / 64;
+    u32 bit = cpu % 64;
+    if (word >= 8)
+        return false;
+    unsigned long mask = BPF_CORE_READ(cpus_ptr, bits[word]);
+    return (mask & (1UL << bit)) != 0;
+}
+
+/**
+ * Initial Task Placement & Wakeup CPU Selection (Design §Initial Task Placement):
+ * When a task wakes up or is created/forked, select the CPU with the fewest
+ * runnable tasks currently in its dispatch grid, respecting CPU affinity masks.
+ * Starts search from prev_cpu to preserve cache locality on ties.
+ */
+s32 BPF_STRUCT_OPS(grid_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags) {
+    u32 total = nr_cpus;
+    if (total == 0 || total > 64)
+        total = 64;
+
+    s32 best_cpu = -1;
+    u32 min_tasks = (u32)-1;
+
+    for (u32 i = 0; i < 64; ++i) {
+        if (i >= total)
+            break;
+        u32 cand_cpu = ((u32)prev_cpu + i) % total;
+
+        if (!task_can_run_on_cpu(p, cand_cpu))
+            continue;
+
+        struct cpu_state *state = get_cpu_state_of(cand_cpu);
+        if (!state)
+            continue;
+
+        /* Atomic read prevents tearing / data races with concurrent enqueues/dequeues */
+        u32 tasks = READ_ONCE(state->total_tasks);
+
+        if (tasks == 0) {
+            /* Found an empty dispatch grid: immediately select this CPU */
+            return (s32)cand_cpu;
+        }
+
+        if (tasks < min_tasks) {
+            min_tasks = tasks;
+            best_cpu = (s32)cand_cpu;
+        }
+    }
+
+    if (best_cpu >= 0)
+        return best_cpu;
+
+    return prev_cpu;
+}
+
+/**
  * Triggers when a task is being enqueued. Two possible cases:
  * 
  * (1) The task is new to the scheduler and its per-task data is not
@@ -245,7 +306,8 @@ void BPF_STRUCT_OPS(grid_exit, struct scx_exit_info *ei) {
  * latency target comparison (Design §Wakeup Preemption Trigger).
  */
 void BPF_STRUCT_OPS(grid_enqueue, struct task_struct *p, u64 enq_flags) {
-    u32 cpu = bpf_get_smp_processor_id();
+    s32 task_cpu = scx_bpf_task_cpu(p);
+    u32 cpu = (task_cpu >= 0 && task_cpu < (s32)nr_cpus) ? (u32)task_cpu : bpf_get_smp_processor_id();
 
     struct task_metadata *task_metadata = get_task_metadata(p);
     if (!task_metadata) {
@@ -329,6 +391,11 @@ void BPF_STRUCT_OPS(grid_enqueue, struct task_struct *p, u64 enq_flags) {
     // Update CPU summary information and task counters after insertion
     cpu_state_enq_task(state, dsq);
 
+    // If enqueued to a remote CPU, kick it to trigger immediate dispatch
+    if (cpu != bpf_get_smp_processor_id()) {
+        scx_bpf_kick_cpu(cpu, 0);
+    }
+
     bpf_debug("CPU #%u enqueued task %d (%s) on DSQ ID %llx", cpu, p->pid, p->comm, task_metadata->dsq_id);
     bpf_debug("Set summary flag to %llx", state->summary);
 
@@ -341,8 +408,9 @@ void BPF_STRUCT_OPS(grid_enqueue, struct task_struct *p, u64 enq_flags) {
     /*
      * Wakeup Preemption Trigger (Design §Task Lifecycle & Preemption Rules):
      * If T_rem of running task > l_wake of this waking task, preempt.
+     * Evaluated against the locally executing task on this CPU.
      */
-    if (enq_flags & SCX_ENQ_WAKEUP) {
+    if ((enq_flags & SCX_ENQ_WAKEUP) && cpu == bpf_get_smp_processor_id()) {
         u32 wake_row = GRID_DSQ_ROW(task_metadata->dsq_id);
         if (wake_row < GRID_NR_ROWS) {
             u64 l_wake = (u64)latency[wake_row] * NS;
@@ -473,20 +541,21 @@ static __noinline bool try_work_steal(s32 cpu, struct cpu_state *state) {
             continue;
 
         struct cpu_state *remote = get_cpu_state_of(remote_cpu);
-        if (!remote || !remote->summary)
+        if (!remote || !READ_ONCE(remote->summary))
             continue;
 
         scanned_candidates++;
 
         /* Start scanning from remote CPU's next_row_sched for inter-row fairness */
-        u32 remote_start_row = remote->next_row_sched;
+        u32 remote_start_row = READ_ONCE(remote->next_row_sched);
         if (remote_start_row >= GRID_NR_ROWS) remote_start_row = 0;
 
         for (u32 ri = 0; ri < GRID_NR_ROWS; ++ri) {
             u32 row = (remote_start_row + ri) % GRID_NR_ROWS;
             if (row >= GRID_NR_ROWS) continue;
 
-            grid_summary_t row_summary = remote->summary & grid_row_masks[row];
+            grid_summary_t remote_sum = READ_ONCE(remote->summary);
+            grid_summary_t row_summary = remote_sum & grid_row_masks[row];
             if (!row_summary)
                 continue;
 
@@ -743,6 +812,7 @@ void BPF_STRUCT_OPS(grid_stopping, struct task_struct *p, bool runnable) {
 
 
 SCX_OPS_DEFINE(grid_ops,
+	       .select_cpu	= (void*) grid_select_cpu,
 	       .init 		= (void*) grid_init,
 	       .exit 		= (void*) grid_exit,
 		   .enqueue 	= (void*) grid_enqueue,

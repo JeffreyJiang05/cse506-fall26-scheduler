@@ -184,10 +184,6 @@ static inline void cpu_state_deq_task(struct cpu_state *cpu_state, dsq_id_t dsq)
 				if (cpu_state->task_counters[idx] > 0) {
 					__sync_fetch_and_or(&cpu_state->summary, mask);
 				}
-				u32 row = GRID_DSQ_ROW(dsq);
-				if (row < GRID_NR_ROWS && !(cpu_state->summary & grid_row_masks[row])) {
-					cpu_state->rows[row].deficit = 0;
-				}
 			}
 			break;
 		}

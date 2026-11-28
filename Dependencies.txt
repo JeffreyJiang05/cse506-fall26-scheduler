@@ -1,2 +1,8 @@
 bpftool
-libbpf
+make 
+automake 
+libtool 
+pkg-config 
+libaio-dev
+libmysqlclient-dev 
+libssl-dev
