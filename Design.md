@@ -209,17 +209,20 @@ To prevent task starvation and comply with eBPF's strict 30-second runnable task
    * Sets timeslice quantum: $t_c = \text{slices}[c] \times 10^6\text{ ns}$.
    * Inserts task into target CPU's DSQ via `scx_bpf_dsq_insert(p, dsq, t_c, 0)`.
    * Updates target CPU summary bitmap and task counters via `cpu_state_enq_task`.
-   * **Remote Core Wakeup:** If `target_cpu != bpf_get_smp_processor_id()`, sends a kick IPI via `scx_bpf_kick_cpu(target_cpu, 0)` so the remote core immediately dispatches the newly assigned task.
+   * **Remote Core Wakeup:** If `target_cpu != bpf_get_smp_processor_id()`:
+     * If waking task is latency-critical ($i_{\text{wake}} < \text{DEFAULT\_ROW}$), sends a preemptive IPI via `scx_bpf_kick_cpu(target_cpu, SCX_KICK_PREEMPT)` so the remote core immediately reschedules.
+     * Otherwise, sends `scx_bpf_kick_cpu(target_cpu, 0)` to wake the remote core if idle.
    * Evaluates Wakeup Preemption for locally enqueued tasks.
 4. **Wakeup Preemption Trigger:**
-   * When a waking task is enqueued on the local core with target latency $l_{wake}$ and row $i_{wake}$:
+   * When a waking task is enqueued on the local core with target latency $l_{\text{wake}}$ and row $i_{\text{wake}}$:
    * Evaluates the currently executing task `curr` on that CPU.
    * Issues preemption (`scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT)`) if and only if:
-     $$i_{wake} < i_{curr} \quad \land \quad T_{rem} > l_{wake}$$
-     where $T_{rem} = t_{curr\_slice} - (\text{now} - t_{curr\_start})$.
+     $$(i_{\text{wake}} < i_{\text{curr}} \lor i_{\text{wake}} < \text{DEFAULT\_ROW}) \quad \land \quad T_{\text{rem}} > l_{\text{wake}}$$
+     where $T_{\text{rem}} = t_{\text{curr\_slice}} - (\text{now} - t_{\text{curr\_start}})$ and $l_{\text{wake}} = \text{latency}[i_{\text{wake}}] \times 1000\text{ ns}$.
 5. **Dispatch Event (`grid_dispatch`):**
    * If `state->summary == 0`, invokes `try_work_steal`.
-   * Otherwise, executes DRR inter-row selection and RR intra-row selection.
+   * **Priority Dispatch:** Checks latency-critical rows $i \in [0, \text{DEFAULT\_ROW}-1]$ (futex sync, epoll polling, read I/O). If any task is present, dispatches it immediately using intra-row round robin, bypassing the DRR loop.
+   * **Fair DRR Dispatch:** If all high-priority rows are empty, executes DRR inter-row selection across remaining rows and RR intra-row selection across columns.
    * Moves task to CPU local queue via `scx_bpf_dsq_move_to_local(dsq)`.
    * Deducts cost from row deficit, decrements counters via `cpu_state_deq_task`, advances row and column pointers, and reports `EVENT_TASK_DISPATCH`.
 6. **Running Event (`grid_running`):**
@@ -239,8 +242,11 @@ The scheduler enforces a complementary dual-strategy load balancing architecture
 
 * **Traversal:** The idle core probes remote cores in round-robin sequence starting from $(\text{cpu} + 1) \pmod N$ across all online cores ($N = \text{nr\_cpus}$, bounded to 64).
 * **Instant Rejection of Idle Cores:** The probing core inspects the remote core's 64-bit `remote->summary` bitmap in a single memory lookup. Cores with `remote->summary == 0` are bypassed immediately without inspecting queues.
-* **Remote Inter-Row Fairness:** When probing a remote core with active tasks (`remote->summary != 0`), queue scanning begins at that remote core's `next_row_sched` cursor.
-* **Bounded Verifier Complexity:** To guarantee that the BPF program stays well within the kernel's 1,000,000 instruction verification limit, deep DSQ cell scanning is bounded to at most $\text{WORK\_STEAL\_MAX\_CPUS} = 4$ active remote candidate cores.
+* **Latency-Prioritized Stealing:** When probing a remote core with active tasks (`remote->summary != 0`), queue scanning begins at Row 0 (highest latency priority) and proceeds downward through Row 7, ensuring that latency-critical tasks stuck on overloaded cores are offloaded immediately.
+* **Bounded Verifier Complexity:** To guarantee that the BPF program stays well within the kernel's 1,000,000 instruction verification limit:
+  * In both `try_work_steal` and `grid_dispatch`, cell discovery (target row and column determination) is decoupled from kernel dispatch. Candidate coordinates are identified first via pure bitwise mask evaluation and integer comparisons with zero helper calls in loops.
+  * Helper calls (`scx_bpf_dsq_move_to_local`), atomic decrements (`cpu_state_deq_task`), and ring buffer event submissions are executed at a single site outside the loops, eliminating combinatorial branch explosion in the BPF verifier.
+  * Atomic counter updates in `cpu_state_deq_task` use single-instruction atomic operations rather than bounded CAS retry loops.
 * **Affinity-Preserving Stealing:**
   * Work stealing extracts tasks using `scx_bpf_dsq_move_to_local(remote_dsq)`.
   * If the task at the head of a remote DSQ has CPU affinity restrictions that prevent execution on the stealing core, `scx_bpf_dsq_move_to_local` returns `false`.

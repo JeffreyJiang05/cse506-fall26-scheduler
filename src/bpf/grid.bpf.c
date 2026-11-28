@@ -22,7 +22,7 @@ UEI_DEFINE(uei);
 
 // *========================== Useful Macros ==========================* //
 
-#define DRR_MAX_ITERATIONS 3
+#define DRR_MAX_ITERATIONS 2
 #define WORK_STEAL_MAX_CPUS 4  /* Max CPUs to probe during work stealing */
 
 /**
@@ -391,9 +391,25 @@ void BPF_STRUCT_OPS(grid_enqueue, struct task_struct *p, u64 enq_flags) {
     // Update CPU summary information and task counters after insertion
     cpu_state_enq_task(state, dsq);
 
-    // If enqueued to a remote CPU, kick it to trigger immediate dispatch
+    u32 wake_row = GRID_DSQ_ROW(task_metadata->dsq_id);
+
+    // If enqueued to a remote CPU:
     if (cpu != bpf_get_smp_processor_id()) {
-        scx_bpf_kick_cpu(cpu, 0);
+        /*
+         * Remote Wakeup Preemption:
+         * If a latency-critical task (wake_row < DEFAULT_ROW) wakes up on a remote CPU,
+         * send SCX_KICK_PREEMPT so the remote CPU preempts whatever is running immediately.
+         * Flag 0 only wakes an idle CPU; SCX_KICK_PREEMPT forces preemption on busy cores.
+         */
+        if ((enq_flags & SCX_ENQ_WAKEUP) && wake_row < DEFAULT_ROW) {
+            scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+            report_event(EVENT_TASK_PREEMPT,
+                .pid = p->pid,
+                .dsq = task_metadata->dsq_id,
+                .victim_pid = 0);
+        } else {
+            scx_bpf_kick_cpu(cpu, 0);
+        }
     }
 
     bpf_debug("CPU #%u enqueued task %d (%s) on DSQ ID %llx", cpu, p->pid, p->comm, task_metadata->dsq_id);
@@ -411,7 +427,6 @@ void BPF_STRUCT_OPS(grid_enqueue, struct task_struct *p, u64 enq_flags) {
      * Evaluated against the locally executing task on this CPU.
      */
     if ((enq_flags & SCX_ENQ_WAKEUP) && cpu == bpf_get_smp_processor_id()) {
-        u32 wake_row = GRID_DSQ_ROW(task_metadata->dsq_id);
         if (wake_row < GRID_NR_ROWS) {
             u64 l_wake = (u64)latency[wake_row] * NS_PER_US;
             bool should_preempt = false;
@@ -423,12 +438,11 @@ void BPF_STRUCT_OPS(grid_enqueue, struct task_struct *p, u64 enq_flags) {
                 if (curr_meta && curr_meta->timeslice_start > 0) {
                     u32 curr_row = GRID_DSQ_ROW(curr_meta->dsq_id);
                     /*
-                     * Only preempt if waking task has higher latency priority
-                     * (strictly lower row index) than the currently running task,
-                     * AND the running task's remaining timeslice exceeds waking
-                     * task's latency target (T_rem > l_wake).
+                     * Preempt if waking task has higher latency priority (wake_row < curr_row),
+                     * or if waking task is latency-critical (wake_row < DEFAULT_ROW),
+                     * and the running task's remaining timeslice exceeds waking task's latency target (T_rem > l_wake).
                      */
-                    if (wake_row < curr_row) {
+                    if (wake_row < curr_row || wake_row < DEFAULT_ROW) {
                         u64 now = bpf_ktime_get_ns();
                         u64 elapsed = (now > curr_meta->timeslice_start) ?
                                       (now - curr_meta->timeslice_start) : 0;
@@ -531,7 +545,10 @@ static __noinline bool try_work_steal(s32 cpu, struct cpu_state *state) {
     if (total > 64)
         total = 64;
 
-    u32 scanned_candidates = 0;
+    s32 target_cpu = -1;
+    struct cpu_state *target_remote = NULL;
+    u32 target_row = (u32)-1;
+    u32 target_col = (u32)-1;
 
     for (u32 i = 0; i < 64; ++i) {
         if (i >= total)
@@ -541,61 +558,74 @@ static __noinline bool try_work_steal(s32 cpu, struct cpu_state *state) {
             continue;
 
         struct cpu_state *remote = get_cpu_state_of(remote_cpu);
-        if (!remote || !READ_ONCE(remote->summary))
+        if (!remote)
             continue;
 
-        scanned_candidates++;
+        grid_summary_t remote_sum = READ_ONCE(remote->summary);
+        if (!remote_sum)
+            continue;
 
-        /* Start scanning from remote CPU's next_row_sched for inter-row fairness */
-        u32 remote_start_row = READ_ONCE(remote->next_row_sched);
-        if (remote_start_row >= GRID_NR_ROWS) remote_start_row = 0;
-
-        for (u32 ri = 0; ri < GRID_NR_ROWS; ++ri) {
-            u32 row = (remote_start_row + ri) % GRID_NR_ROWS;
-            if (row >= GRID_NR_ROWS) continue;
-
-            grid_summary_t remote_sum = READ_ONCE(remote->summary);
-            grid_summary_t row_summary = remote_sum & grid_row_masks[row];
-            if (!row_summary)
-                continue;
-
-            for (u32 col = 0; col < GRID_NR_COLS; ++col) {
-                if (!(row_summary & SUMMARY_ROW_COL(row, col)))
-                    continue;
-
-                dsq_id_t remote_dsq = GRID_DSQ_ID(remote_cpu, GRID_DSQ_COORD(row, col));
-                if (scx_bpf_dsq_move_to_local(remote_dsq)) {
-                    bpf_debug("CPU #%d stole task from CPU #%u DSQ (%u,%u)",
-                              cpu, remote_cpu, row, col);
-                    cpu_state_deq_task(remote, remote_dsq);
-
-                    telemetry_update_task_count(state);
-
-                    // Report work stealing / task migration event
-                    report_event(EVENT_TASK_MIGRATE,
-                        .pid = 0,
-                        .src_cpu = remote_cpu,
-                        .dst_cpu = cpu,
-                        .dsq = remote_dsq);
-
-                    // Report dispatch event
-                    report_event(EVENT_TASK_DISPATCH,
-                        .pid = 0,
-                        .dsq = remote_dsq);
-                    return true;
-                }
+        /* Find highest-priority non-empty row (Row 0, 1, ...) */
+        for (u32 r = 0; r < GRID_NR_ROWS; ++r) {
+            if (remote_sum & grid_row_masks[r]) {
+                target_row = r;
+                break;
             }
         }
-        if (scanned_candidates >= WORK_STEAL_MAX_CPUS)
+        if (target_row >= GRID_NR_ROWS)
+            continue;
+
+        /* Find first non-empty column in target_row */
+        u32 start_col = remote->rows[target_row].next_col_sched;
+        if (start_col >= GRID_NR_COLS) start_col = 0;
+
+        for (u32 ci = 0; ci < GRID_NR_COLS; ++ci) {
+            u32 c = (start_col + ci) % GRID_NR_COLS;
+            if (c >= GRID_NR_COLS) continue;
+            if (remote_sum & SUMMARY_ROW_COL(target_row, c)) {
+                target_col = c;
+                break;
+            }
+        }
+        if (target_col < GRID_NR_COLS) {
+            target_cpu = (s32)remote_cpu;
+            target_remote = remote;
             break;
+        }
     }
+
+    if (target_cpu < 0 || !target_remote || target_row >= GRID_NR_ROWS || target_col >= GRID_NR_COLS)
+        return false;
+
+    /* Exactly ONE scx_bpf_dsq_move_to_local call in try_work_steal */
+    dsq_id_t remote_dsq = GRID_DSQ_ID((u32)target_cpu, GRID_DSQ_COORD(target_row, target_col));
+    if (scx_bpf_dsq_move_to_local(remote_dsq)) {
+        bpf_debug("CPU #%d stole task from CPU #%d DSQ (%u,%u)",
+                  cpu, target_cpu, target_row, target_col);
+        cpu_state_deq_task(target_remote, remote_dsq);
+
+        telemetry_update_task_count(state);
+
+        report_event(EVENT_TASK_MIGRATE,
+            .pid = 0,
+            .src_cpu = (u32)target_cpu,
+            .dst_cpu = cpu,
+            .dsq = remote_dsq);
+
+        report_event(EVENT_TASK_DISPATCH,
+            .pid = 0,
+            .dsq = remote_dsq);
+        return true;
+    }
+
     return false;
 }
 
 /*
  * grid_dispatch: Select a task to run using the two-tier fairness engine.
- *   - Inter-row: Deficit Round Robin across rows 0..7
- *   - Intra-row: Standard Round Robin across columns 0..7
+ *   - Priority dispatch for latency-critical rows (Rows 0..DEFAULT_ROW-1)
+ *   - Inter-row Deficit Round Robin across remaining rows
+ *   - Intra-row Standard Round Robin across columns
  *
  * If the local grid is empty, attempt work stealing from remote CPUs.
  */
@@ -614,86 +644,100 @@ void BPF_STRUCT_OPS(grid_dispatch, s32 cpu, struct task_struct *prev) {
 
     bpf_debug("CPU #%d Summary %llx", cpu, state->summary);
 
+    u32 target_row = (u32)-1;
+    u32 target_col = (u32)-1;
+    bool is_drr = false;
+
     /*
-     * DRR dispatch: iterate up to DRR_MAX_ITERATIONS rounds.
+     * Priority Dispatch for Interactive / Latency-Critical Rows:
+     * Check high-priority rows (Rows 0..DEFAULT_ROW-1: futex, epoll, read)
+     * before running the DRR loop. If any latency-critical task is ready,
+     * dispatch it immediately to eliminate wakeup latency and avoid DRR queueing delay.
+     */
+    if (state->summary & (grid_row_masks[0] | grid_row_masks[1] | grid_row_masks[2])) {
+        for (u32 prio_row = 0; prio_row < DEFAULT_ROW; ++prio_row) {
+            if (state->summary & grid_row_masks[prio_row]) {
+                u32 start_col = cpu_state_row_metadata(state, prio_row).next_col_sched;
+                if (start_col >= GRID_NR_COLS) start_col = 0;
+
+                for (u32 ci = 0; ci < GRID_NR_COLS; ++ci) {
+                    u32 c = (start_col + ci) % GRID_NR_COLS;
+                    if (c >= GRID_NR_COLS) continue;
+                    if (state->summary & SUMMARY_ROW_COL(prio_row, c)) {
+                        target_row = prio_row;
+                        target_col = c;
+                        break;
+                    }
+                }
+                if (target_row < GRID_NR_ROWS)
+                    break;
+            }
+        }
+    }
+
+    /*
+     * DRR dispatch: if no interactive task was selected, iterate across rows.
      * Each round starts scanning from next_row_sched for fairness.
      */
-    for (u32 iter = 0; iter < DRR_MAX_ITERATIONS; ++iter) {
+    if (target_row >= GRID_NR_ROWS) {
+        is_drr = true;
         u32 start_row = state->next_row_sched;
         if (start_row >= GRID_NR_ROWS) start_row = 0;
 
-        for (u32 ri = 0; ri < GRID_NR_ROWS; ++ri) {
-            u32 row = (start_row + ri) % GRID_NR_ROWS;
-            if (row >= GRID_NR_ROWS) continue; /* verifier hint */
+        for (u32 iter = 0; iter < DRR_MAX_ITERATIONS; ++iter) {
+            for (u32 ri = 0; ri < GRID_NR_ROWS; ++ri) {
+                u32 row = (start_row + ri) % GRID_NR_ROWS;
+                if (row >= GRID_NR_ROWS) continue;
 
-            grid_summary_t row_summary = state->summary & grid_row_masks[row];
-
-            // No task in the row, set the deficit to zero and move to next row
-            if (!row_summary) {
-                cpu_state_row_metadata(state, row).deficit = 0;
-                continue;
-            }
-
-            // Row is not empty, increase the deficit by the quantum
-            drr_apply_quantum(state, row, drr_quanta[row]);
-
-            // Perform round robin within the row itself
-            u32 start_col = cpu_state_row_metadata(state, row).next_col_sched;
-            if (start_col >= GRID_NR_COLS) start_col = 0;
-
-            for (u32 ci = 0; ci < GRID_NR_COLS; ++ci) {
-                u32 col = (start_col + ci) % GRID_NR_COLS;
-                if (col >= GRID_NR_COLS) continue; /* verifier hint */
-
-                if (!(row_summary & SUMMARY_ROW_COL(row, col)))
+                if (!(state->summary & grid_row_masks[row])) {
+                    cpu_state_row_metadata(state, row).deficit = 0;
                     continue;
-
-                u32 cost = slices[col];
-
-                bpf_debug("Found a bit at row %u and col %u.", row, col);
-
-                // Check if the row can schedule a task with this cost
-                if (drr_can_schedule(state, row, cost)) {
-                    // Schedule the task by moving it into the local DSQ
-                    dsq_id_t dsq = GRID_DSQ_ID(cpu, GRID_DSQ_COORD(row, col));
-                    bpf_debug("CPU #%d: Attempting to move task from DSQ %llx", cpu, dsq);
-                    if (!scx_bpf_dsq_move_to_local(dsq)) {
-                        continue;
-                    }
-
-                    bpf_debug("Successfully scheduled a task");
-
-                    // Successfully scheduled the task
-                    // Decrement the deficit
-                    drr_apply_cost(state, row, cost);
-
-                    // decrement the task counters and update summary
-                    cpu_state_deq_task(state, dsq);
-
-                    // Update intra-row RR: next column to schedule
-                    cpu_state_row_metadata(state, row).next_col_sched = (col + 1) % GRID_NR_COLS;
-
-                    // Update inter-row DRR: next row to start from
-                    state->next_row_sched = (row + 1) % GRID_NR_ROWS;
-
-                    // Report dispatch event
-                    report_event(EVENT_TASK_DISPATCH,
-                        .pid = 0,
-                        .dsq = dsq);
-
-                    // Update telemetry
-                    telemetry_update_task_count(state);
-                    return;
                 }
+
+                drr_apply_quantum(state, row, drr_quanta[row]);
+
+                u32 start_col = cpu_state_row_metadata(state, row).next_col_sched;
+                if (start_col >= GRID_NR_COLS) start_col = 0;
+
+                for (u32 ci = 0; ci < GRID_NR_COLS; ++ci) {
+                    u32 col = (start_col + ci) % GRID_NR_COLS;
+                    if (col >= GRID_NR_COLS) continue;
+                    if (!(state->summary & SUMMARY_ROW_COL(row, col)))
+                        continue;
+
+                    u32 cost = slices[col];
+                    if (drr_can_schedule(state, row, cost)) {
+                        target_row = row;
+                        target_col = col;
+                        break;
+                    }
+                }
+
+                if (target_row < GRID_NR_ROWS)
+                    break;
             }
 
-            /*
-             * If after scanning all columns in the row, the row has no
-             * remaining tasks in the summary bitmap, reset deficit to 0.
-             */
-            if (!(state->summary & grid_row_masks[row])) {
-                cpu_state_row_metadata(state, row).deficit = 0;
+            if (target_row < GRID_NR_ROWS)
+                break;
+        }
+    }
+
+    if (target_row < GRID_NR_ROWS && target_col < GRID_NR_COLS) {
+        dsq_id_t dsq = GRID_DSQ_ID(cpu, GRID_DSQ_COORD(target_row, target_col));
+        if (scx_bpf_dsq_move_to_local(dsq)) {
+            if (is_drr) {
+                drr_apply_cost(state, target_row, slices[target_col]);
+                state->next_row_sched = (target_row + 1) % GRID_NR_ROWS;
             }
+            cpu_state_deq_task(state, dsq);
+            cpu_state_row_metadata(state, target_row).next_col_sched = (target_col + 1) % GRID_NR_COLS;
+
+            report_event(EVENT_TASK_DISPATCH,
+                .pid = 0,
+                .dsq = dsq);
+
+            telemetry_update_task_count(state);
+            return;
         }
     }
 
@@ -781,6 +825,9 @@ void BPF_STRUCT_OPS(grid_stopping, struct task_struct *p, bool runnable) {
         if (T >= t_c) {
             /* Demotion: task consumed full quantum (CPU-bound) */
             new_col = INC_COL(old_col);
+            /* Latency penalty on full timeslice expiration: demote row */
+            if (runnable)
+                new_row = INC_ROW(old_row);
         } else if (!runnable && T < t_c / 2) {
             /* Promotion: task voluntarily yielded early (interactive/I/O-bound) */
             new_col = DEC_COL(old_col);
