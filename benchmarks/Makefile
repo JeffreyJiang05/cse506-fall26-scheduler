@@ -1,0 +1,15 @@
+SCHBENCH_DIR = schbench
+SCHBENCH_EXEC = $(SCHBENCH_DIR)/schbench
+
+RT_TESTS_DIR = rt-tests
+HACKBENCH_EXEC = $(RT_TESTS_DIR)/hackbench
+
+all: $(SCHBENCH_EXEC) $(HACKBENCH_EXEC)
+
+$(SCHBENCH_EXEC): 
+	make -C $(SCHBENCH_DIR)
+
+$(HACKBENCH_EXEC):
+	make -C $(RT_TESTS_DIR) hackbench
+
+.PHONY: all

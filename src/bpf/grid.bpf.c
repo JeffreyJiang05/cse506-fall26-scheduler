@@ -309,9 +309,6 @@ void BPF_STRUCT_OPS(grid_enqueue, struct task_struct *p, u64 enq_flags) {
     struct cpu_state *state = get_cpu_state_of(cpu);
     if (!state) return;
 
-    // Update CPU summary information
-    cpu_state_enq_task(state, dsq);
-
     // Determine the timeslice allocated to task
     u32 col = GRID_DSQ_COL(dsq);
     if (col >= GRID_NR_COLS) col = DEFAULT_COL;
@@ -323,11 +320,14 @@ void BPF_STRUCT_OPS(grid_enqueue, struct task_struct *p, u64 enq_flags) {
     // Set flag that it is on the queue
     task_metadata->on_queue = true;
     
-    // Insert into DSQ
+    // Insert into DSQ first
     scx_bpf_dsq_insert(p, 
         dsq, 
         task_metadata->timeslice_duration, 
         0);
+
+    // Update CPU summary information and task counters after insertion
+    cpu_state_enq_task(state, dsq);
 
     bpf_debug("CPU #%u enqueued task %d (%s) on DSQ ID %llx", cpu, p->pid, p->comm, task_metadata->dsq_id);
     bpf_debug("Set summary flag to %llx", state->summary);
@@ -438,8 +438,12 @@ void BPF_STRUCT_OPS(grid_dequeue, struct task_struct *p, u64 deq_flags) {
 
 #define drr_can_schedule(cpu_state, row, cost) (cpu_state_row_metadata((cpu_state), (row)).deficit >= (cost))
 
+#define DRR_MAX_DEFICIT(row) (drr_quanta[(row)] + slices[GRID_NR_COLS - 1])
+
 #define drr_apply_quantum(cpu_state, row, quantum) do { \
 	(cpu_state)->rows[(row)].deficit += (quantum); \
+	if ((cpu_state)->rows[(row)].deficit > (s32)DRR_MAX_DEFICIT(row)) \
+		(cpu_state)->rows[(row)].deficit = (s32)DRR_MAX_DEFICIT(row); \
 } while (0)
 
 #define drr_apply_cost(cpu_state, row, cost) do { \
@@ -453,18 +457,26 @@ void BPF_STRUCT_OPS(grid_dequeue, struct task_struct *p, u64 deq_flags) {
  * preventing state space explosion in grid_dispatch.
  */
 static __noinline bool try_work_steal(s32 cpu, struct cpu_state *state) {
-    u32 nr = nr_cpus;
-    if (nr > WORK_STEAL_MAX_CPUS)
-        nr = WORK_STEAL_MAX_CPUS;
+    u32 total = nr_cpus;
+    if (total == 0)
+        return false;
+    if (total > 64)
+        total = 64;
 
-    for (u32 i = 0; i < WORK_STEAL_MAX_CPUS && i < nr; ++i) {
-        u32 remote_cpu = ((u32)cpu + 1 + i) % nr;
+    u32 scanned_candidates = 0;
+
+    for (u32 i = 0; i < 64; ++i) {
+        if (i >= total)
+            break;
+        u32 remote_cpu = ((u32)cpu + 1 + i) % total;
         if (remote_cpu == (u32)cpu)
             continue;
 
         struct cpu_state *remote = get_cpu_state_of(remote_cpu);
         if (!remote || !remote->summary)
             continue;
+
+        scanned_candidates++;
 
         /* Start scanning from remote CPU's next_row_sched for inter-row fairness */
         u32 remote_start_row = remote->next_row_sched;
@@ -488,9 +500,6 @@ static __noinline bool try_work_steal(s32 cpu, struct cpu_state *state) {
                               cpu, remote_cpu, row, col);
                     cpu_state_deq_task(remote, remote_dsq);
 
-                    // Update remote CPU next row
-                    remote->next_row_sched = (row + 1) % GRID_NR_ROWS;
-
                     telemetry_update_task_count(state);
 
                     // Report work stealing / task migration event
@@ -508,6 +517,8 @@ static __noinline bool try_work_steal(s32 cpu, struct cpu_state *state) {
                 }
             }
         }
+        if (scanned_candidates >= WORK_STEAL_MAX_CPUS)
+            break;
     }
     return false;
 }
@@ -606,8 +617,22 @@ void BPF_STRUCT_OPS(grid_dispatch, s32 cpu, struct task_struct *prev) {
                     return;
                 }
             }
+
+            /*
+             * If after scanning all columns in the row, the row has no
+             * remaining tasks in the summary bitmap, reset deficit to 0.
+             */
+            if (!(state->summary & grid_row_masks[row])) {
+                cpu_state_row_metadata(state, row).deficit = 0;
+            }
         }
     }
+
+    /*
+     * If all iterations finished without scheduling a task, advance
+     * the row pointer so subsequent dispatches try the next row.
+     */
+    state->next_row_sched = (state->next_row_sched + 1) % GRID_NR_ROWS;
 }
 
 /*
@@ -701,8 +726,8 @@ void BPF_STRUCT_OPS(grid_stopping, struct task_struct *p, bool runnable) {
      * it will be re-classified on wakeup by the syscall tracepoint
      * handler. If it's still runnable (preempted), keep the same row.
      */
-
-	task_metadata->dsq_id = GRID_DSQ_COORD(new_row, new_col);
+    u32 cpu = bpf_get_smp_processor_id();
+    task_metadata->dsq_id = GRID_DSQ_ID(cpu, GRID_DSQ_COORD(new_row, new_col));
 
     if (runnable) {
         // Task stopped while still runnable (preempted / time slice expired)

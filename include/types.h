@@ -161,33 +161,48 @@ static inline void cpu_state_enq_task(struct cpu_state *cpu_state, dsq_id_t dsq)
 	u32 idx = GRID_DSQ_IDX(dsq);
 	grid_summary_t dsq_bitmask = DSQ_TO_SUMMARY(dsq);
 
-	__sync_fetch_and_or(&cpu_state->summary, dsq_bitmask);
 	__sync_fetch_and_add(&cpu_state->task_counters[idx], 1);
 	__sync_fetch_and_add(&cpu_state->total_tasks, 1);
+	__sync_fetch_and_or(&cpu_state->summary, dsq_bitmask);
 }
 
 static inline void cpu_state_deq_task(struct cpu_state *cpu_state, dsq_id_t dsq) {
 	u32 idx = GRID_DSQ_IDX(dsq);
+	grid_summary_t mask = DSQ_TO_SUMMARY(dsq);
 
-	/* Underflow protection for total_tasks */
-	if (cpu_state->total_tasks > 0) {
-		__sync_fetch_and_sub(&cpu_state->total_tasks, 1);
+	/* Underflow-safe atomic decrement for task_counters */
+	u32 old_cnt = cpu_state->task_counters[idx];
+	for (int i = 0; i < 10; ++i) {
+		if (old_cnt == 0)
+			break;
+		u32 prev = __sync_val_compare_and_swap(&cpu_state->task_counters[idx], old_cnt, old_cnt - 1);
+		if (prev == old_cnt) {
+			if (old_cnt == 1) {
+				/* Counter reached 0: atomically clear summary bit */
+				__sync_fetch_and_and(&cpu_state->summary, ~mask);
+				/* Double check if an enqueue happened concurrently */
+				if (cpu_state->task_counters[idx] > 0) {
+					__sync_fetch_and_or(&cpu_state->summary, mask);
+				}
+				u32 row = GRID_DSQ_ROW(dsq);
+				if (row < GRID_NR_ROWS && !(cpu_state->summary & grid_row_masks[row])) {
+					cpu_state->rows[row].deficit = 0;
+				}
+			}
+			break;
+		}
+		old_cnt = prev;
 	}
 
-	/* Underflow protection for task_counters */
-	if (cpu_state->task_counters[idx] > 0) {
-		u32 prev = __sync_fetch_and_sub(&cpu_state->task_counters[idx], 1);
-		if (prev == 1) {
-			/* Counter reached 0: atomically clear summary bit */
-			__sync_fetch_and_and(&cpu_state->summary, ~DSQ_TO_SUMMARY(dsq));
-			u32 row = GRID_DSQ_ROW(dsq);
-			if (row < GRID_NR_ROWS && !(cpu_state->summary & grid_row_masks[row])) {
-				cpu_state->rows[row].deficit = 0;
-			}
-		}
-	} else {
-		/* Counter was already 0: ensure summary bit is cleared if set */
-		__sync_fetch_and_and(&cpu_state->summary, ~DSQ_TO_SUMMARY(dsq));
+	/* Underflow-safe atomic decrement for total_tasks */
+	u32 old_tot = cpu_state->total_tasks;
+	for (int i = 0; i < 10; ++i) {
+		if (old_tot == 0)
+			break;
+		u32 prev = __sync_val_compare_and_swap(&cpu_state->total_tasks, old_tot, old_tot - 1);
+		if (prev == old_tot)
+			break;
+		old_tot = prev;
 	}
 }
 

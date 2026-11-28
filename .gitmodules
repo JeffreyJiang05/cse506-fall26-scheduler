@@ -1,3 +1,9 @@
 [submodule "libbpf"]
 	path = libbpf
 	url = git@github.com:libbpf/libbpf.git
+[submodule "benchmarks/schbench"]
+	path = benchmarks/schbench
+	url = git@github.com:masoncl/schbench.git
+[submodule "benchmarks/rt-tests"]
+	path = benchmarks/rt-tests
+	url = git://git.kernel.org/pub/scm/utils/rt-tests/rt-tests.git

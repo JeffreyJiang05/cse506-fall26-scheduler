@@ -136,11 +136,12 @@ struct us_sched_event {
 static const char help_msg[] = 
 "The grid scheduler: A multidimensional multilevel feedback queue scheduler.\n"
 "\n"
-"Usage: %s [-h] [-t] [-l config-file] [-q config-file] [-d config-file]\n"
+"Usage: %s [-h] [-t] [-o log-file] [-l config-file] [-q config-file] [-d config-file]\n"
 "\n"
 "  -l config-file  Configuration file for the latencies for each row of the DSQ grid\n"
 "  -q config-file  Configuration file for the time slices for each column of the DSQ grid\n"
 "  -d config-file  Configuration file for the DRR quanta for each row of the DSQ grid\n"
+"  -o log-file     Output file to store scheduler event log\n"
 "  -t              Launch interactive ncurses TUI\n"
 "  -h              Display this help and exit\n";
 
@@ -153,6 +154,7 @@ static const char help_msg[] =
  * ============================================================ */
 
 static volatile sig_atomic_t exit_flag = 0;
+static FILE *event_log_file = NULL;
 static const __u16 default_latencies[GRID_NR_ROWS] = { 1, 2, 3, 5, 8, 13, 21, 34 };
 static const __u16 default_slices[GRID_NR_COLS] = { 1, 2, 4, 8, 16, 32, 64, 128 };
 static const __u16 default_drr[GRID_NR_ROWS] = { 512, 384, 256, 192, 128, 96, 64, 32 };
@@ -204,12 +206,13 @@ struct sched_args {
     char *latency_config_filename;
     char *slice_config_filename;
     char *drr_config_filename;
+    char *event_log_filename;
     int   tui_mode;
 };
 
 static void process_args(int argc, char *argv[], struct sched_args *out) {
-    __u32 opt;
-    while ((opt = getopt(argc, argv, "l:q:d:th")) != -1) {
+    int opt;
+    while ((opt = getopt(argc, argv, "l:q:d:o:th")) != -1) {
         switch (opt) {
         case 'l':
             out->latency_config_filename = optarg;
@@ -222,6 +225,10 @@ static void process_args(int argc, char *argv[], struct sched_args *out) {
         case 'd':
             out->drr_config_filename = optarg;
             info("DRR quanta config input file: %s", out->drr_config_filename);
+            break;
+        case 'o':
+            out->event_log_filename = optarg;
+            info("Event log output file: %s", out->event_log_filename);
             break;
         case 't':
             out->tui_mode = 1;
@@ -445,19 +452,29 @@ static void format_event_detail(const struct us_sched_event *ev, char *detail, s
     }
 }
 
+/* Format a full event log line including timestamp, event type, and decomposed fields */
+static void format_event_line(const struct us_sched_event *ev, char *buf, size_t buf_sz) {
+    char detail[256];
+    format_event_detail(ev, detail, sizeof(detail));
+
+    snprintf(buf, buf_sz, "EVENT [%llu]: %-15s %s\n",
+             (unsigned long long)ev->timestamp,
+             event_type_name(ev->type),
+             detail);
+}
+
 /* Event callback for non-TUI mode */
 static int handle_event(void *ctx, void *data, size_t data_sz) {
     if (data_sz < sizeof(struct us_sched_event))
         return 0;
 
     const struct us_sched_event *ev = (const struct us_sched_event *)data;
-    char detail[256];
-    format_event_detail(ev, detail, sizeof(detail));
+    char line[384];
+    format_event_line(ev, line, sizeof(line));
 
-    fprintf(stderr, "EVENT [%llu]: %-15s %s\n",
-            (unsigned long long)ev->timestamp,
-            event_type_name(ev->type),
-            detail);
+    fputs(line, stderr);
+    if (event_log_file)
+        fputs(line, event_log_file);
     return 0;
 }
 
@@ -501,11 +518,19 @@ static const struct us_sched_event *event_log_get(int idx) {
     return &event_log.entries[pos].event;
 }
 
-/* TUI ring buffer callback — pushes into the event log */
+/* TUI ring buffer callback — pushes into the event log (and optional log file) */
 static int tui_handle_event(void *ctx, void *data, size_t data_sz) {
     if (data_sz < sizeof(struct us_sched_event))
         return 0;
-    event_log_push((const struct us_sched_event *)data);
+
+    const struct us_sched_event *ev = (const struct us_sched_event *)data;
+    event_log_push(ev);
+
+    if (event_log_file) {
+        char line[384];
+        format_event_line(ev, line, sizeof(line));
+        fputs(line, event_log_file);
+    }
     return 0;
 }
 
@@ -971,6 +996,16 @@ int main(int argc, char *argv[]) {
     struct sched_args args = { 0 };
     process_args(argc, argv, &args);
 
+    if (args.event_log_filename) {
+        event_log_file = fopen(args.event_log_filename, "w");
+        if (!event_log_file) {
+            fprintf(stderr, "Failed to open event log file '%s': %s\n",
+                    args.event_log_filename, strerror(errno));
+            return 1;
+        }
+        setvbuf(event_log_file, NULL, _IOLBF, 0);
+    }
+
     while (true) {
         info("Opening SCX skeleton");
         skel = SCX_OPS_OPEN(grid_ops, grid_bpf);
@@ -1015,6 +1050,7 @@ int main(int argc, char *argv[]) {
         __u64 ecode = UEI_REPORT(skel, uei);
 
         if (rb) {
+            ring_buffer__poll(rb, 0);
             ring_buffer__free(rb);
             rb = NULL;
         }
@@ -1023,6 +1059,12 @@ int main(int argc, char *argv[]) {
         grid_bpf__destroy(skel);
 
         if (!UEI_ECODE_RESTART(ecode)) break;
+    }
+
+    if (event_log_file) {
+        fflush(event_log_file);
+        fclose(event_log_file);
+        event_log_file = NULL;
     }
 
     info("End of program execution");

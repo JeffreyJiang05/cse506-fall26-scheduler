@@ -6,6 +6,7 @@ SRCD = src
 BLDD = build
 BIND = bin
 INCD = include
+BENCHMARKD = benchmarks
 
 # Source C files
 SRCS = $(SRCD)/sched.c
@@ -44,6 +45,9 @@ debug: BUILD_VERSION := debug
 debug: CFLAGS += $(DFLAGS)
 debug: BPF_FLAGS += $(DFLAGS)
 debug: $(BIND)/$(TARGET)
+
+benchmark:
+	make -C $(BENCHMARKD)
 
 .PHONY: FORCE
 $(BUILD_VERSION_STAMP): FORCE | $(BLDD)
