@@ -138,7 +138,7 @@ static const char help_msg[] =
 "\n"
 "Usage: %s [-h] [-t] [-o log-file] [-l config-file] [-q config-file] [-d config-file]\n"
 "\n"
-"  -l config-file  Configuration file for the latencies for each row of the DSQ grid\n"
+"  -l config-file  Configuration file for the latencies (in us) for each row of the DSQ grid\n"
 "  -q config-file  Configuration file for the time slices for each column of the DSQ grid\n"
 "  -d config-file  Configuration file for the DRR quanta for each row of the DSQ grid\n"
 "  -o log-file     Output file to store scheduler event log\n"
@@ -155,7 +155,7 @@ static const char help_msg[] =
 
 static volatile sig_atomic_t exit_flag = 0;
 static FILE *event_log_file = NULL;
-static const __u16 default_latencies[GRID_NR_ROWS] = { 1, 2, 3, 5, 8, 13, 21, 34 };
+static const __u32 default_latencies[GRID_NR_ROWS] = { 250, 500, 1000, 2000, 4000, 8000, 16000, 32000 };
 static const __u16 default_slices[GRID_NR_COLS] = { 1, 2, 4, 8, 16, 32, 64, 128 };
 static const __u16 default_drr[GRID_NR_ROWS] = { 512, 384, 256, 192, 128, 96, 64, 32 };
 
@@ -263,13 +263,32 @@ static int parse_u16(char *token, __u16 *value) {
     return ret;
 }
 
-static int parse_file(FILE *file, int nr_args, char *delimiter, __u16 *output) {
+static int parse_u32(char *token, __u32 *value) {
+    int old_errno = errno;
+    int ret = -1;
+
+    errno = 0; 
+    char *end; 
+    unsigned long val = strtoul((token), &end, 10); 
+    if (errno == 0 && end != token && val <= UINT32_MAX) {
+        *value = (__u32) val;
+        ret = 0;
+    }
+
+    errno = old_errno;
+    return ret;
+}
+
+static int parse_file_u16(FILE *file, int nr_args, char *delimiter, __u16 *output) {
     char *lineptr = NULL;
     size_t n = 0;
     ssize_t bytes_read = 0;
 
     bytes_read = getline(&lineptr, &n, file);
-    if (!bytes_read) return -1;
+    if (bytes_read <= 0) {
+        if (lineptr) free(lineptr);
+        return -1;
+    }
 
     char *iter = lineptr;
     char *token = NULL; 
@@ -295,6 +314,41 @@ static int parse_file(FILE *file, int nr_args, char *delimiter, __u16 *output) {
     return 0;
 }
 
+static int parse_file_u32(FILE *file, int nr_args, char *delimiter, __u32 *output) {
+    char *lineptr = NULL;
+    size_t n = 0;
+    ssize_t bytes_read = 0;
+
+    bytes_read = getline(&lineptr, &n, file);
+    if (bytes_read <= 0) {
+        if (lineptr) free(lineptr);
+        return -1;
+    }
+
+    char *iter = lineptr;
+    char *token = NULL; 
+    int nr_tokens = 0;
+
+    while (nr_tokens < nr_args && (token = strsep(&iter, delimiter)) != NULL) {
+        if (parse_u32(token, &output[nr_tokens]) == -1) {
+            warn("Failed to parse %s into u32", token);
+            free(lineptr);
+            return -1;
+        }
+        nr_tokens++;
+    }
+
+    if (nr_tokens != nr_args) {
+        warn("Tokens parsed != Expected number of tokens");
+        free(lineptr);
+        return -1;
+    }
+
+    info("Successfully parsed file");
+    free(lineptr);
+    return 0;
+}
+
 static void configure_latency(struct grid_bpf *skel, char *latency_file) {
     if (!latency_file) {
         info("No supplied latency configuration file. Using default");
@@ -303,7 +357,7 @@ static void configure_latency(struct grid_bpf *skel, char *latency_file) {
     }
 
     FILE *file = fopen(latency_file, "r");
-    if (!file || parse_file(file, GRID_NR_ROWS, ":", &skel->rodata->latency[0]) == -1) {
+    if (!file || parse_file_u32(file, GRID_NR_ROWS, ":", &skel->rodata->latency[0]) == -1) {
         warn("Problem handling %s (either problem with the file or file format). Resorting to default", latency_file);
         memcpy(&skel->rodata->latency[0], &default_latencies[0], sizeof(default_latencies[0]) * GRID_NR_ROWS);
     }
@@ -318,7 +372,7 @@ static void configure_timeslices(struct grid_bpf *skel, char *slices_file) {
     }
 
     FILE *file = fopen(slices_file, "r");
-    if (!file || parse_file(file, GRID_NR_COLS, ":", &skel->rodata->slices[0]) == -1) {
+    if (!file || parse_file_u16(file, GRID_NR_COLS, ":", &skel->rodata->slices[0]) == -1) {
         warn("Problem handling %s (either problem with the file or file format). Resorting to default", slices_file);
         memcpy(&skel->rodata->slices[0], &default_slices[0], sizeof(default_slices[0]) * GRID_NR_COLS);
     }
@@ -333,7 +387,7 @@ static void configure_drr_quanta(struct grid_bpf *skel, char *drr_file) {
     }
 
     FILE *file = fopen(drr_file, "r");
-    if (!file || parse_file(file, GRID_NR_ROWS, ":", &skel->rodata->drr_quanta[0]) == -1) {
+    if (!file || parse_file_u16(file, GRID_NR_ROWS, ":", &skel->rodata->drr_quanta[0]) == -1) {
         warn("Problem handling %s (either problem with the file or file format). Resorting to default", drr_file);
         memcpy(&skel->rodata->drr_quanta[0], &default_drr[0], sizeof(default_drr[0]) * GRID_NR_ROWS);
     }
@@ -349,7 +403,7 @@ static void configure_scheduler(struct grid_bpf *skel, struct sched_args *args) 
 
     info(" === SCHEDULER CONFIGURATION BEGIN ===");
     info(" NR_CPUS = %u", skel->rodata->nr_cpus);
-    for (int i = 0; i < GRID_NR_ROWS; ++i) info(" LATENCY[%d] = %u", i, skel->rodata->latency[i]);
+    for (int i = 0; i < GRID_NR_ROWS; ++i) info(" LATENCY[%d] = %u us", i, skel->rodata->latency[i]);
     for (int i = 0; i < GRID_NR_COLS; ++i) info(" SLICE[%d] = %u", i, skel->rodata->slices[i]);
     for (int i = 0; i < GRID_NR_ROWS; ++i) info(" DRR_QUANTUM[%d] = %u", i, skel->rodata->drr_quanta[i]);
     info(" === SCHEDULER CONFIGURATION END ===");

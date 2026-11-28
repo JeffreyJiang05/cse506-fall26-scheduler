@@ -48,14 +48,14 @@ UEI_DEFINE(uei);
  * Data to be populated by userspace
  */
 const volatile u32 nr_cpus; // Number of CPU cores
-const volatile u16 latency[GRID_NR_ROWS]; // Latency target for each row in grid (ms)
+const volatile u32 latency[GRID_NR_ROWS]; // Latency target for each row in grid (us)
 const volatile u16 slices[GRID_NR_COLS]; // Time slices for each column in grid (ms)
 const volatile u16 drr_quanta[GRID_NR_ROWS]; // Quanta for DRR
 
 static void debug_printk_config() {
     bpf_debug("nr_cpus = %d", nr_cpus);
     for (u32 i = 0; i < GRID_NR_ROWS; ++i) {
-        bpf_debug("latency[%u] = %u", i, latency[i]);
+        bpf_debug("latency[%u] = %u us", i, latency[i]);
     }
     for (u32 i = 0; i < GRID_NR_COLS; ++i) {
         bpf_debug("slices[%u] = %u", i, slices[i]);
@@ -413,7 +413,7 @@ void BPF_STRUCT_OPS(grid_enqueue, struct task_struct *p, u64 enq_flags) {
     if ((enq_flags & SCX_ENQ_WAKEUP) && cpu == bpf_get_smp_processor_id()) {
         u32 wake_row = GRID_DSQ_ROW(task_metadata->dsq_id);
         if (wake_row < GRID_NR_ROWS) {
-            u64 l_wake = (u64)latency[wake_row] * NS;
+            u64 l_wake = (u64)latency[wake_row] * NS_PER_US;
             bool should_preempt = false;
             u32 victim_pid = 0;
 

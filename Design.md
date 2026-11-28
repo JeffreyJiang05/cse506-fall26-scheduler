@@ -88,7 +88,7 @@ The scheduler exposes three key configuration vectors across the 8 rows and 8 co
 
 | Parameter Vector          | Symbol | Dimensions                    | Description & Unit                                        | Default Progression                                   |
 | :------------------------ | :----- | :---------------------------- | :-------------------------------------------------------- | :---------------------------------------------------- |
-| **Target Latency Vector** | $l_i$  | Row Array ($i \in [0, 7]$)    | Maximum latency threshold assigned to row $i$ (ms)         | $\{1, 2, 3, 5, 8, 13, 21, 34\}$ (Fibonacci)          |
+| **Target Latency Vector** | $l_i$  | Row Array ($i \in [0, 7]$)    | Maximum latency threshold assigned to row $i$ ($\mu$s)     | $\{250, 500, 1000, 2000, 4000, 8000, 16000, 32000\}$ ($250\,\mu\text{s}$ to $32\,\text{ms}$) |
 | **Time Slice Vector**     | $t_j$  | Column Array ($j \in [0, 7]$) | Allotted CPU execution quantum assigned to column $j$ (ms) | $\{1, 2, 4, 8, 16, 32, 64, 128\}$ (Powers of 2)      |
 | **DRR Quantum Vector**    | $q_i$  | Row Array ($i \in [0, 7]$)    | Deficit Round Robin replenishment quantum for row $i$     | $\{512, 384, 256, 192, 128, 96, 64, 32\}$ (Harmonic) |
 
